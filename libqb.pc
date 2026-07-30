@@ -1,0 +1,10 @@
+prefix=/home/christine/scratch/libqb-rs
+exec_prefix=${prefix}
+libdir=${prefix}/target/debug
+includedir=${prefix}/include
+
+Name: libqb
+Description: Rust port of libqb (IPC, logging, ring buffers, event loops)
+Version: 0.18.0
+Libs: -L${libdir} -lqb
+Cflags: -I${includedir}
