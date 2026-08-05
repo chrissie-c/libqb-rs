@@ -6,8 +6,12 @@
 #include "qb.h"
 
 /* Boolean aliases */
+#ifndef QB_TRUE
 #define QB_TRUE  1
+#endif
+#ifndef QB_FALSE
 #define QB_FALSE 0
+#endif
 
 /* LOG_TRACE: severity below LOG_DEBUG (8) */
 #ifndef LOG_TRACE

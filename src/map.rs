@@ -801,11 +801,15 @@ pub unsafe extern "C" fn qb_map_pref_iter_create(
     m: *mut QbMap,
     prefix: *const libc::c_char,
 ) -> *mut QbMapIter {
-    if m.is_null() || prefix.is_null() {
+    if m.is_null() {
         return ptr::null_mut();
     }
-    let p = CStr::from_ptr(prefix);
-    let iter = (*m).backend.iter_create_prefix(p);
+    let iter = if prefix.is_null() {
+        (*m).backend.iter_create()
+    } else {
+        let p = CStr::from_ptr(prefix);
+        (*m).backend.iter_create_prefix(p)
+    };
     Box::into_raw(Box::new(QbMapIter {
         inner: iter,
         current_key: None,

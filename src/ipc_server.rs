@@ -2,9 +2,9 @@
 
 use crate::error::{QbError, QbResult};
 use crate::ipc::{
-    event_socket_name, unix_server_listen, shm_rb_names,
+    event_socket_name, unix_server_listen,
     QbIpcRequestHeader, QbIpcResponseHeader, QbIpcShmConnectionResponse, QbIpcType,
-    QB_IPC_MSG_AUTHENTICATE, QB_IPC_MSG_DISCONNECT,
+    QB_IPC_MSG_AUTHENTICATE, QB_IPC_MSG_DISCONNECT, PATH_MAX,
 };
 use crate::ringbuffer::{QbRingbuffer, QB_RB_FLAG_CREATE, QB_RB_FLAG_SHARED_PROCESS};
 use std::collections::HashMap;
@@ -121,6 +121,8 @@ pub struct QbIpcsConnection {
     shm_request_rb: Option<Box<QbRingbuffer>>,
     shm_response_rb: Option<Box<QbRingbuffer>>,
     shm_event_rb: Option<Box<QbRingbuffer>>,
+    // Directory created by mkdtemp for SHM ring buffer files.
+    shm_dir: Option<String>,
     ipc_type: QbIpcType,
     #[allow(dead_code)]
     pid: libc::pid_t,
@@ -159,6 +161,7 @@ impl QbIpcsConnection {
             shm_request_rb: None,
             shm_response_rb: None,
             shm_event_rb: None,
+            shm_dir: None,
             ipc_type,
             pid,
             uid,
@@ -340,18 +343,23 @@ impl QbIpcsService {
 
         let (pid_from_cred, uid, gid) = peer_credentials(fd)?;
 
-        // Read auth request: QbIpcRequestHeader + u32 max_msg + u32 client_pid.
-        let hdr_size = std::mem::size_of::<QbIpcRequestHeader>();
-        let mut req_buf = vec![0u8; hdr_size + 8];
+        // Read auth request: qb_ipc_connection_request (C layout, 24 bytes total):
+        //   hdr.id       at offset 0  (4 bytes)
+        //   hdr._pad_id  at offset 4  (4 bytes, padding)
+        //   hdr.size     at offset 8  (4 bytes)
+        //   hdr._pad_sz  at offset 12 (4 bytes, padding)
+        //   max_msg_size at offset 16 (4 bytes)
+        //   padding      at offset 20 (4 bytes, align(8))
+        let mut req_buf = [0u8; 24];
         stream.read_exact(&mut req_buf).map_err(QbError::from)?;
 
         let hdr = unsafe { &*(req_buf.as_ptr() as *const QbIpcRequestHeader) };
         if hdr.id != QB_IPC_MSG_AUTHENTICATE {
             return Err(QbError::new(libc::EPROTO));
         }
-        let client_max = u32::from_le_bytes(req_buf[hdr_size..hdr_size + 4].try_into().unwrap());
-        let auth_pid = i32::from_le_bytes(req_buf[hdr_size + 4..hdr_size + 8].try_into().unwrap());
-        let pid = if pid_from_cred != 0 { pid_from_cred } else { auth_pid };
+        // max_msg_size is at offset 16 in C's qb_ipc_connection_request.
+        let client_max = u32::from_le_bytes(req_buf[16..20].try_into().unwrap());
+        let pid = pid_from_cred;
         let effective_max = (self.max_buf_size as usize).max(client_max as usize);
 
         let mut conn = QbIpcsConnection::new(
@@ -393,24 +401,31 @@ impl QbIpcsService {
             );
         }
 
-        let resp = QbIpcResponseHeader {
-            id: QB_IPC_MSG_AUTHENTICATE,
-            size: (std::mem::size_of::<QbIpcResponseHeader>() + 4) as i32,
-            error: if accepted == 0 { 0 } else { accepted },
-            _pad: 0,
-        };
+        // Send the full connection response (must be sizeof(qb_ipc_connection_response) = 12328 bytes).
+        let mut sock_resp = QbIpcShmConnectionResponse::zeroed();
+        sock_resp.hdr = QbIpcResponseHeader::new(
+            QB_IPC_MSG_AUTHENTICATE,
+            std::mem::size_of::<QbIpcShmConnectionResponse>() as i32,
+            if accepted == 0 { 0 } else { accepted },
+        );
+        sock_resp.connection_type = QbIpcType::Socket as i32;
+        sock_resp.max_msg_size = effective_max as u32;
+        sock_resp.connection = conn.as_mut() as *mut QbIpcsConnection as u64;
         let resp_bytes = unsafe {
-            std::slice::from_raw_parts(&resp as *const _ as *const u8, std::mem::size_of::<QbIpcResponseHeader>())
+            std::slice::from_raw_parts(
+                &sock_resp as *const _ as *const u8,
+                std::mem::size_of::<QbIpcShmConnectionResponse>(),
+            )
         };
         conn.stream.write_all(resp_bytes).map_err(QbError::from)?;
-        conn.stream.write_all(&(effective_max as u32).to_le_bytes()).map_err(QbError::from)?;
 
         if accepted != 0 {
             if let Some(ref p) = ev_fs_path { let _ = std::fs::remove_file(p); }
             return Err(QbError::new(accepted.unsigned_abs() as i32));
         }
 
-        if let Ok((ev_stream, _)) = ev_listener.accept() {
+        let ev_result = ev_listener.accept();
+        if let Ok((ev_stream, _)) = ev_result {
             conn.event_stream = Some(ev_stream);
         }
         if let Some(ref p) = ev_fs_path { let _ = std::fs::remove_file(p); }
@@ -435,49 +450,73 @@ impl QbIpcsService {
         effective_max: usize,
     ) -> QbResult<RawFd> {
         let server_pid = unsafe { libc::getpid() };
-        let (req_name, rsp_name, evt_name) = shm_rb_names(&self.service_name, server_pid, pid, fd);
+
+        // Create a temporary directory matching C libqb's mkdtemp pattern:
+        //   /dev/shm/qb-<server_pid>-<client_pid>-<fd>-XXXXXX
+        // Then ring buffer names are: <dir>/qb-{request,response,event}-<service>
+        let tmpl = format!("/dev/shm/qb-{}-{}-{}-XXXXXX\0", server_pid, pid, fd);
+        let mut tmpl_bytes = tmpl.into_bytes();
+        let dir = unsafe {
+            let p = libc::mkdtemp(tmpl_bytes.as_mut_ptr() as *mut libc::c_char);
+            if p.is_null() {
+                return Err(QbError::from_last_os_error());
+            }
+            // Set directory permissions to 0770.
+            libc::chmod(p, 0o770);
+            // chown — may fail if not root; ignore.
+            libc::chown(p, uid, gid);
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+        };
+
+        // Ring buffer base names (without -header/-data suffixes).
+        let req_name = format!("{}/qb-request-{}", dir, self.service_name);
+        let rsp_name = format!("{}/qb-response-{}", dir, self.service_name);
+        let evt_name = format!("{}/qb-event-{}", dir, self.service_name);
 
         let rb_flags = QB_RB_FLAG_CREATE | QB_RB_FLAG_SHARED_PROCESS;
-        // Size ring buffers at 2× max_msg_size so a single max-size message
-        // (which needs max_msg_size + 8 bytes of chunk header) always fits.
-        let rb_size = effective_max * 2;
-        // sizeof(i32) user_data in request RB holds the flow-control flag.
+        let rb_size = effective_max;
         let req_rb = QbRingbuffer::open(&req_name, rb_size, rb_flags, std::mem::size_of::<i32>())?;
         let rsp_rb = match QbRingbuffer::open(&rsp_name, rb_size, rb_flags, 0) {
             Ok(rb) => rb,
-            Err(e) => { drop(req_rb); return Err(e); }
+            Err(e) => {
+                drop(req_rb);
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
+            }
         };
         let evt_rb = match QbRingbuffer::open(&evt_name, rb_size, rb_flags, 0) {
             Ok(rb) => rb,
-            Err(e) => { drop(req_rb); drop(rsp_rb); return Err(e); }
+            Err(e) => {
+                drop(req_rb); drop(rsp_rb);
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
+            }
         };
 
         let _ = req_rb.chown(uid, gid);
         let _ = rsp_rb.chown(uid, gid);
         let _ = evt_rb.chown(uid, gid);
 
-        let mut shm_resp = QbIpcShmConnectionResponse {
-            hdr: QbIpcResponseHeader {
-                id: QB_IPC_MSG_AUTHENTICATE,
-                size: std::mem::size_of::<QbIpcShmConnectionResponse>() as i32,
-                error: if accepted == 0 { 0 } else { accepted },
-                _pad: 0,
-            },
-            connection_type: QbIpcType::Shm as i32,
-            max_msg_size: effective_max as u32,
-            connection: conn.as_mut() as *mut QbIpcsConnection as u64,
-            request: [0u8; crate::ipc::SHM_PATH_LEN],
-            response: [0u8; crate::ipc::SHM_PATH_LEN],
-            event: [0u8; crate::ipc::SHM_PATH_LEN],
-        };
-        fn copy_name(dst: &mut [u8; crate::ipc::SHM_PATH_LEN], src: &str) {
+        // Build connection response matching struct qb_ipc_connection_response (12328 bytes).
+        let mut shm_resp = QbIpcShmConnectionResponse::zeroed();
+        shm_resp.hdr = QbIpcResponseHeader::new(
+            QB_IPC_MSG_AUTHENTICATE,
+            std::mem::size_of::<QbIpcShmConnectionResponse>() as i32,
+            if accepted == 0 { 0 } else { accepted },
+        );
+        shm_resp.connection_type = QbIpcType::Shm as i32;
+        shm_resp.max_msg_size = effective_max as u32;
+        shm_resp.connection = conn.as_mut() as *mut QbIpcsConnection as u64;
+
+        fn copy_rb_name(dst: &mut [u8; PATH_MAX], src: &str) {
             let b = src.as_bytes();
-            let n = b.len().min(crate::ipc::SHM_PATH_LEN - 1);
+            let n = b.len().min(PATH_MAX - 1);
             dst[..n].copy_from_slice(&b[..n]);
         }
-        copy_name(&mut shm_resp.request, &req_name);
-        copy_name(&mut shm_resp.response, &rsp_name);
-        copy_name(&mut shm_resp.event, &evt_name);
+        copy_rb_name(&mut shm_resp.request, &req_name);
+        copy_rb_name(&mut shm_resp.response, &rsp_name);
+        copy_rb_name(&mut shm_resp.event, &evt_name);
+
 
         let resp_bytes = unsafe {
             std::slice::from_raw_parts(
@@ -488,12 +527,16 @@ impl QbIpcsService {
         conn.stream.write_all(resp_bytes).map_err(QbError::from)?;
 
         if accepted != 0 {
+            // Rejected — clean up ring buffers and directory.
+            drop(req_rb); drop(rsp_rb); drop(evt_rb);
+            let _ = std::fs::remove_dir_all(&dir);
             return Err(QbError::new(accepted.unsigned_abs() as i32));
         }
 
         conn.shm_request_rb = Some(req_rb);
         conn.shm_response_rb = Some(rsp_rb);
         conn.shm_event_rb = Some(evt_rb);
+        conn.shm_dir = Some(dir);
 
         if let Some(cb) = self.service_handlers.connection_created {
             unsafe { cb(conn.as_mut()) };
@@ -651,6 +694,7 @@ impl QbIpcsService {
 
         if let Some(cb) = self.service_handlers.msg_process {
             unsafe { cb(conn_ptr, buf.as_mut_ptr() as *mut libc::c_void, msg_size) };
+        } else {
         }
 
         Ok(())
@@ -674,6 +718,17 @@ impl QbIpcsService {
 
             if let Some(cb) = self.service_handlers.connection_destroyed {
                 unsafe { cb(conn.as_mut()) };
+            }
+
+            // Take ownership of the SHM dir path before dropping ring buffers.
+            let shm_dir = conn.shm_dir.take();
+            // Drop ring buffers (unlinks header/data files).
+            conn.shm_request_rb.take();
+            conn.shm_response_rb.take();
+            conn.shm_event_rb.take();
+            // Now remove the empty directory.
+            if let Some(dir) = shm_dir {
+                let _ = std::fs::remove_dir_all(&dir);
             }
             // conn drops here, closing streams.
         }
@@ -740,18 +795,21 @@ impl Drop for QbIpcsService {
 
 unsafe extern "C" fn accept_callback(_fd: i32, _revents: i32, data: *mut libc::c_void) -> i32 {
     let service = &mut *(data as *mut QbIpcsService);
-    if let Ok(conn_fd) = service.accept_connection() {
-        if let Some(ref ph) = service.poll_handlers {
-            if let Some(add) = ph.dispatch_add {
-                add(
-                    crate::event_loop::QbLoopPriority::Med,
-                    conn_fd,
-                    libc::POLLIN as i32,
-                    data,
-                    Some(dispatch_callback),
-                );
+    match service.accept_connection() {
+        Ok(conn_fd) => {
+            if let Some(ref ph) = service.poll_handlers {
+                if let Some(add) = ph.dispatch_add {
+                    add(
+                        crate::event_loop::QbLoopPriority::Med,
+                        conn_fd,
+                        libc::POLLIN as i32,
+                        data,
+                        Some(dispatch_callback),
+                    );
+                }
             }
         }
+        Err(_) => {}
     }
     0
 }
@@ -1038,7 +1096,9 @@ pub unsafe extern "C" fn qb_ipcs_connection_first_get(
     s: *mut QbIpcsService,
 ) -> *mut QbIpcsConnection {
     if s.is_null() { return ptr::null_mut(); }
-    (*s).connection_first().unwrap_or(ptr::null_mut())
+    let c = (*s).connection_first().unwrap_or(ptr::null_mut());
+    if !c.is_null() { (*c).ref_count += 1; }
+    c
 }
 
 /// # Safety
@@ -1049,7 +1109,9 @@ pub unsafe extern "C" fn qb_ipcs_connection_next_get(
     current: *mut QbIpcsConnection,
 ) -> *mut QbIpcsConnection {
     if s.is_null() || current.is_null() { return ptr::null_mut(); }
-    (*s).connection_next(current).unwrap_or(ptr::null_mut())
+    let c = (*s).connection_next(current).unwrap_or(ptr::null_mut());
+    if !c.is_null() { (*c).ref_count += 1; }
+    c
 }
 
 /// # Safety

@@ -1,6 +1,27 @@
 use std::env;
 use std::path::PathBuf;
 
+// Replace the cbindgen-generated full struct qb_hdb body with a forward
+// declaration.  qbhdb.h provides the complete struct with the public field
+// names needed by QB_HDB_DECLARE.  A forward declaration is sufficient here
+// because all qb_hdb_* signatures only reference the type through a pointer.
+fn guard_hdb_struct(content: String) -> String {
+    let full_def = concat!(
+        "typedef struct qb_hdb {\n",
+        "  uint32_t _handle_count;\n",
+        "  uint32_t _pad0;\n",
+        "  void *_inner;\n",
+        "  uint32_t _iterator_c;\n",
+        "  uint32_t _pad1;\n",
+        "  uintptr_t _destructor;\n",
+        "  uint32_t _first_run;\n",
+        "  uint32_t _pad2;\n",
+        "} qb_hdb;",
+    );
+    let fwd_decl = "struct qb_hdb;\ntypedef struct qb_hdb qb_hdb;";
+    content.replace(full_def, fwd_decl)
+}
+
 fn main() {
     let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_path = PathBuf::from(&crate_dir).join("include").join("qb").join("qb.h");
@@ -22,6 +43,14 @@ fn main() {
         // Use word-boundary-aware replacements: longer patterns first.
         .replace("const iovec *", "const struct iovec *")
         .replace(", iovec *", ", struct iovec *");
+
+    // Replace the cbindgen-generated struct qb_hdb body with a forward declaration.
+    // qbhdb.h provides the complete definition with the public field names that
+    // QB_HDB_DECLARE requires, without conflicting with this file regardless of
+    // include order.  The forward declaration is sufficient here because all
+    // qb_hdb_* function signatures only use the type through a pointer.
+    let fixed = guard_hdb_struct(fixed);
+
     std::fs::write(&out_path, fixed).unwrap();
 
     // Compile C shims (va_list functions not expressible in stable Rust).

@@ -122,21 +122,21 @@ impl QbIpccConnection {
     }
 
     /// Phase 1: send the authentication request to the server.
+    /// Matches C's qb_ipc_connection_request (24 bytes):
+    ///   hdr.id(4) + pad(4) + hdr.size(4) + pad(4) + max_msg_size(4) + pad(4)
     fn send_auth(&mut self, max_msg_size: usize) -> QbResult<()> {
-        let hdr_size = std::mem::size_of::<QbIpcRequestHeader>();
-        let req = QbIpcRequestHeader {
-            id: QB_IPC_MSG_AUTHENTICATE,
-            size: hdr_size as i32 + 8,  // +4 max_msg +4 pid
+        // C's sizeof(qb_ipc_connection_request) = 24 bytes.
+        let mut buf = [0u8; 24];
+        let req = QbIpcRequestHeader::new(QB_IPC_MSG_AUTHENTICATE, 24);
+        let hdr_bytes = unsafe {
+            std::slice::from_raw_parts(&req as *const _ as *const u8, std::mem::size_of::<QbIpcRequestHeader>())
         };
-        let req_bytes = unsafe {
-            std::slice::from_raw_parts(&req as *const _ as *const u8, hdr_size)
-        };
-        let max_bytes = (max_msg_size as u32).to_le_bytes();
-        let pid_bytes = (unsafe { libc::getpid() } as u32).to_le_bytes();
+        buf[..16].copy_from_slice(hdr_bytes);
+        // max_msg_size at offset 16.
+        buf[16..20].copy_from_slice(&(max_msg_size as u32).to_le_bytes());
+        // bytes 20-23 remain 0 (padding).
 
-        self.stream.write_all(req_bytes).map_err(QbError::from)?;
-        self.stream.write_all(&max_bytes).map_err(QbError::from)?;
-        self.stream.write_all(&pid_bytes).map_err(QbError::from)?;
+        self.stream.write_all(&buf).map_err(QbError::from)?;
         Ok(())
     }
 
@@ -173,8 +173,8 @@ impl QbIpccConnection {
                 self.max_msg_size = server_max as usize;
             }
             if connection_type == QbIpcType::Shm as i32 {
-                // Extract ring buffer names from the fixed-size path fields.
-                let path_len = crate::ipc::SHM_PATH_LEN;
+                // Extract ring buffer names from the fixed-size PATH_MAX fields.
+                let path_len = crate::ipc::PATH_MAX;
                 // Layout after hdr: i32 connection_type(4) + u32 max_msg_size(4) + u64 connection(8) = 16
                 let name_off = 4 + 4 + 8;
                 let req_bytes = &rest_buf[name_off..name_off + path_len];
@@ -201,19 +201,15 @@ impl QbIpccConnection {
                         .map_err(|e| { self.shm_request_rb = None; self.shm_response_rb = None; e })?
                 );
                 self.ipc_type = QbIpcType::Shm;
-            }
-        } else {
-            // Socket response: 4 extra bytes = server max_msg_size.
-            if remaining >= 4 {
-                let server_max = u32::from_le_bytes(rest_buf[0..4].try_into().unwrap());
-                if server_max as usize > self.max_msg_size {
-                    self.max_msg_size = server_max as usize;
+            } else {
+                // Socket mode: connect to the per-pid event socket the server created.
+                let ev_name = event_socket_name(&self.service_name, unsafe { libc::getpid() });
+                match unix_client_connect(&ev_name) {
+                    Ok(s) => {
+                        self.event_stream = Some(s);
+                    }
+                    Err(_) => {}
                 }
-            }
-            // Connect to the event socket that the server created for our pid.
-            let ev_name = event_socket_name(&self.service_name, unsafe { libc::getpid() });
-            if let Ok(s) = unix_client_connect(&ev_name) {
-                self.event_stream = Some(s);
             }
         }
 
@@ -223,10 +219,10 @@ impl QbIpccConnection {
 
     pub fn disconnect(&self) {
         // The stream is closed on drop; shutdown gracefully.
-        let req = QbIpcRequestHeader {
-            id: crate::ipc::QB_IPC_MSG_DISCONNECT,
-            size: std::mem::size_of::<QbIpcRequestHeader>() as i32,
-        };
+        let req = QbIpcRequestHeader::new(
+            crate::ipc::QB_IPC_MSG_DISCONNECT,
+            std::mem::size_of::<QbIpcRequestHeader>() as i32,
+        );
         // Use MSG_NOSIGNAL so that a dead server returns EPIPE instead of
         // delivering SIGPIPE to our process.
         let _ = unsafe {
@@ -396,7 +392,8 @@ impl QbIpccConnection {
         ms_timeout: i32,
     ) -> QbResult<usize> {
         self.sendv(iov)?;
-        self.recv(buf, ms_timeout)
+        let r = self.recv(buf, ms_timeout);
+        r
     }
 
     /// Receive an async event from the server.

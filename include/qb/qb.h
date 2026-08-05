@@ -49,9 +49,9 @@ typedef struct timespec timespec;
 #define QB_IPC_MSG_DISCONNECT -3
 
 /*
- Maximum length for ring-buffer name strings in the SHM connection response.
+ PATH_MAX on Linux (matches C libqb's usage of PATH_MAX in connection response).
  */
-#define SHM_PATH_LEN 256
+#define PATH_MAX 4096
 
 #define QB_LOG_MAX_LEN 512
 
@@ -97,16 +97,16 @@ typedef enum qb_loop_priority {
 
 /*
  Transport type selector.
- Values match C libqb's qb_ipc_type_t: QB_IPC_NATIVE=0, QB_IPC_SHM=1, QB_IPC_SOCKET=2.
+ Values match C libqb's qb_ipc_type_t: QB_IPC_SOCKET=0, QB_IPC_SHM=1.
  */
 enum qb_ipc_type
 #if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
   : int32_t
 #endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
  {
-  Native = 0,
+  Socket = 0,
   Shm = 1,
-  Socket = 2,
+  Native = 4,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -148,11 +148,23 @@ typedef struct qb_array_t qb_array_t;
 
 /*
  Header prepended to every request message (client → server).
+
+
+ Matches C libqb's `struct qb_ipc_request_header` with per-field align(8):
+   int32_t id   __attribute__((aligned(8)));  // offset 0, +4 pad
+   int32_t size __attribute__((aligned(8)));  // offset 8, +4 pad
+ Total: 16 bytes.
  */
 typedef struct qb_ipc_request_header qb_ipc_request_header;
 
 /*
  Header prepended to every response message (server → client).
+
+ Matches C libqb's `struct qb_ipc_response_header` with per-field align(8):
+   int32_t id    __attribute__((aligned(8)));  // offset 0, +4 pad
+   int32_t size  __attribute__((aligned(8)));  // offset 8, +4 pad
+   int32_t error __attribute__((aligned(8)));  // offset 16, +4 pad
+ Total: 24 bytes.
  */
 typedef struct qb_ipc_response_header qb_ipc_response_header;
 
@@ -176,11 +188,6 @@ typedef struct qb_map_t qb_map_t;
 typedef struct qb_map_iter qb_map_iter;
 
 /*
- Shared-memory ring buffer handle.
- */
-typedef struct qb_ringbuffer_t qb_ringbuffer_t;
-
-/*
  Multi-split stopwatch.
  */
 typedef struct qb_util_stopwatch_t qb_util_stopwatch_t;
@@ -192,21 +199,8 @@ typedef struct qb_util_stopwatch_t qb_util_stopwatch_t;
  */
 typedef struct qb_thread_lock_t qb_thread_lock_t;
 
-/*
- Handle database.  Declare with `QB_HDB_DECLARE` (or zero-initialize) then
- call `qb_hdb_create` before use.  The inner pointer is heap-allocated by
- `qb_hdb_create` and freed by `qb_hdb_destroy`.
- */
-typedef struct qb_hdb {
-  /*
-   Heap-allocated inner state; NULL until `qb_hdb_create` is called.
-   */
-  void *inner;
-  /*
-   Optional destructor called for each handle instance when freed.
-   */
-  void (*destructor)(void*);
-} qb_hdb;
+struct qb_hdb;
+typedef struct qb_hdb qb_hdb;
 
 typedef uint64_t qb_handle_t;
 
@@ -528,7 +522,7 @@ void qb_map_iter_free(struct qb_map_iter *iter);
  `QB_HDB_DECLARE`-declared `struct qb_hdb`.
 
  # Safety
- `hdb` must be a valid, writable pointer.
+ `hdb` must be a valid, writable pointer (alignment as low as 4 is accepted).
  */
 void qb_hdb_create(struct qb_hdb *hdb);
 
@@ -724,161 +718,6 @@ const char *qb_ver_str_get(void);
  `buf` must point to at least `buflen` writable bytes.
  */
 char *qb_strerror_r(int32_t errnum, char *buf, size_t buflen);
-
-/*
- Open (or create) a named ring buffer.
-
- `flags` is a bitmask of `QB_RB_FLAG_*` constants.
- `shared_user_data_size` bytes of user data are reserved after the header.
-
- Returns a pointer to the ring buffer handle, or null on failure (errno set).
-
- # Safety
- `name` must be a valid null-terminated C string.
- */
-struct qb_ringbuffer_t *qb_rb_open(const char *name,
-                                   size_t size,
-                                   uint32_t flags,
-                                   size_t shared_user_data_size);
-
-/*
- Close the ring buffer.  The last caller destroys the shared memory.
-
- # Safety
- `rb` must be a valid pointer from `qb_rb_open`.
- */
-void qb_rb_close(struct qb_ringbuffer_t *rb);
-
-/*
- Returns the name of the ring buffer (pointer into shared memory).
-
- # Safety
- `rb` must be a valid pointer.
- */
-const char *qb_rb_name_get(const struct qb_ringbuffer_t *rb);
-
-/*
- Returns a pointer to the shared user data area.
-
- # Safety
- `rb` must be a valid pointer.
- */
-void *qb_rb_shared_user_data_get(const struct qb_ringbuffer_t *rb);
-
-/*
- Returns the current reference count.
-
- # Safety
- `rb` must be a valid pointer.
- */
-int32_t qb_rb_refcount_get(const struct qb_ringbuffer_t *rb);
-
-/*
- Returns the number of free bytes remaining.
-
- # Safety
- `rb` must be a valid pointer.
- */
-ssize_t qb_rb_space_free(const struct qb_ringbuffer_t *rb);
-
-/*
- Returns the number of bytes currently stored (including chunk headers).
-
- # Safety
- `rb` must be a valid pointer.
- */
-ssize_t qb_rb_space_used(const struct qb_ringbuffer_t *rb);
-
-/*
- Returns the number of chunks currently stored.
-
- # Safety
- `rb` must be a valid pointer.
- */
-ssize_t qb_rb_chunks_used(const struct qb_ringbuffer_t *rb);
-
-/*
- Write a chunk to the ring buffer.
-
- Returns the number of data bytes written, or a negative errno value.
-
- # Safety
- `rb` and `data` must be valid pointers.
- */
-ssize_t qb_rb_chunk_write(struct qb_ringbuffer_t *rb, const void *data, size_t len);
-
-/*
- Allocate space for a chunk without writing data.  Fill the returned pointer
- then call `qb_rb_chunk_commit`.
-
- # Safety
- `rb` must be a valid pointer.
- */
-void *qb_rb_chunk_alloc(struct qb_ringbuffer_t *rb, size_t len);
-
-/*
- Commit a chunk allocated with `qb_rb_chunk_alloc`.
-
- # Safety
- `rb` must be a valid pointer.
- */
-int32_t qb_rb_chunk_commit(struct qb_ringbuffer_t *rb, size_t len);
-
-/*
- Peek at the oldest chunk without consuming it.  Sets `*data_out` to point
- directly into shared memory.  Must call `qb_rb_chunk_reclaim` when done.
-
- `ms_timeout`: 0 = non-blocking, <0 = block forever, >0 = wait N ms.
-
- Returns the data length, or a negative errno value.
-
- # Safety
- `rb` and `data_out` must be valid pointers.
- */
-ssize_t qb_rb_chunk_peek(const struct qb_ringbuffer_t *rb, void **data_out, int32_t ms_timeout);
-
-/*
- Advance the read pointer past the oldest chunk (call after `qb_rb_chunk_peek`).
-
- # Safety
- `rb` must be a valid pointer.
- */
-void qb_rb_chunk_reclaim(struct qb_ringbuffer_t *rb);
-
-/*
- Peek, copy data into `data_out`, then reclaim — all in one call.
-
- # Safety
- `rb` and `data_out` must be valid pointers.
- */
-ssize_t qb_rb_chunk_read(struct qb_ringbuffer_t *rb,
-                         void *data_out,
-                         size_t len,
-                         int32_t ms_timeout);
-
-/*
- Serialize ring buffer contents to a file descriptor.
-
- # Safety
- `rb` must be a valid pointer.
- */
-ssize_t qb_rb_write_to_file(const struct qb_ringbuffer_t *rb, int32_t fd);
-
-/*
- Change the owner of the shared memory file.
-
- # Safety
- `rb` must be a valid pointer.
- */
-int32_t qb_rb_chown(const struct qb_ringbuffer_t *rb, uid_t owner, gid_t group);
-
-/*
- Change the permissions of the shared memory file.
-
- # Safety
- `rb` must be a valid pointer.
- */
-int32_t qb_rb_chmod(const struct qb_ringbuffer_t *rb, mode_t mode);
 
 struct qb_loop_t *qb_loop_create(void);
 

@@ -1,20 +1,21 @@
-//! Shared-memory ring buffer.
+//! Shared-memory ring buffer compatible with C libqb's qb_ringbuffer_s.
 //!
-//! Uses the "double-map" trick: the data area is mapped twice consecutively so
-//! that reads and writes spanning the wrap point need no special-case handling.
+//! Uses TWO files per ring buffer (matching C libqb):
+//!   {name}-header  — shared header (qb_ringbuffer_shared_s layout)
+//!   {name}-data    — uint32_t data array
 //!
-//! Chunk layout (8-byte aligned):
-//!   [u32: data_len][u32: magic=0xDEADBEEF][data_len bytes][padding to 8-byte boundary]
+//! Chunk layout (word-based, indices into the u32 data array):
+//!   data[write_pt]            = chunk data length in bytes
+//!   data[(write_pt+1)%ws]     = magic (0xA1A1A1A1 when committed)
+//!   data[(write_pt+2)%ws..]   = chunk data bytes (word-padded)
 //!
-//! The write and read pointers are monotonically increasing u64 values; the
-//! actual offset into the data area is `ptr % data_size`.
+//! Write/read pointers are u32 word indices into the data array.
 
 use crate::error::{QbError, QbResult};
-use std::ffi::CStr;
 use std::ptr;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// ── Public flag constants (match C libqb) ─────────────────────────────────────
 
 pub const QB_RB_FLAG_CREATE: u32 = 0x01;
 pub const QB_RB_FLAG_OVERWRITE: u32 = 0x02;
@@ -22,979 +23,491 @@ pub const QB_RB_FLAG_SHARED_THREAD: u32 = 0x04;
 pub const QB_RB_FLAG_SHARED_PROCESS: u32 = 0x08;
 pub const QB_RB_FLAG_NO_SEMAPHORE: u32 = 0x10;
 
-const MAGIC_HEADER: u32 = 0x5EBC_5EBC;
-const MAGIC_CHUNK: u32 = 0xDEAD_BEEF;
-const VERSION: u32 = 1;
-const CHUNK_HDR_SIZE: usize = 8; // sizeof(u32) * 2
-#[cfg(target_os = "linux")]
-const SHM_DIR: &str = "/dev/shm";
-#[cfg(not(target_os = "linux"))]
-const SHM_DIR: &str = "/tmp";
+// ── Chunk magic values (match C libqb) ───────────────────────────────────────
 
-// ── Shared-memory header (lives at offset 0 of the shm file) ─────────────────
+const CHUNK_MAGIC: u32 = 0xA1A1A1A1;
+const CHUNK_MAGIC_DEAD: u32 = 0xD0D0D0D0;
+
+// ── Shared header (matches C's qb_ringbuffer_shared_s on Linux x86_64) ───────
+//
+// C layout:
+//   uint32_t write_pt;         offset 0
+//   uint32_t read_pt;          offset 4
+//   uint32_t word_size;        offset 8
+//   char hdr_path[4096];       offset 12
+//   char data_path[4096];      offset 4108
+//   int32_t ref_count;         offset 8204
+//   sem_t posix_sem;           offset 8208  (32 bytes on Linux x86_64)
+//   char user_data[1];         offset 8240
+// sizeof = 8248 (align 8 padded)
 
 #[repr(C)]
-struct RbHeader {
-    magic: u32,
-    version: u32,
-    flags: u32,
-    _pad0: u32,
-    data_size: u64,         // usable ring buffer data bytes
-    user_data_size: u32,
-    _pad1: u32,
+struct RbSharedHdr {
+    write_pt: AtomicU32,
+    read_pt: AtomicU32,
+    word_size: u32,
+    hdr_path: [u8; 4096],
+    data_path: [u8; 4096],
     ref_count: AtomicI32,
-    _pad2: u32,
-    write_pt: AtomicU64,    // monotonically increasing write pointer
-    read_pt: AtomicU64,     // monotonically increasing read pointer
-    name: [u8; 256],
+    posix_sem: [u8; 32],
+    // user_data follows immediately after this struct in the mapping
 }
 
-const HEADER_SIZE: usize = std::mem::size_of::<RbHeader>();
+// sizeof(RbSharedHdr) == 8240; C's sizeof() == 8248 (includes user_data[1] + padding).
+// User data starts at offset 8240 in both cases.
+const HDR_STRUCT_SIZE: usize = std::mem::size_of::<RbSharedHdr>(); // should be 8240
+const C_SIZEOF_SHARED_HDR: usize = 8248; // C's sizeof(qb_ringbuffer_shared_s)
 
-// ── Chunk header ──────────────────────────────────────────────────────────────
+// ── Ring buffer handle ────────────────────────────────────────────────────────
 
-#[repr(C)]
-struct ChunkHdr {
-    data_len: u32,
-    magic: u32,
-}
-
-#[inline]
-fn chunk_total_size(data_len: usize) -> usize {
-    // Round (CHUNK_HDR_SIZE + data_len) up to the nearest 8 bytes.
-    (CHUNK_HDR_SIZE + data_len + 7) & !7
-}
-
-// ── POSIX named semaphore wrapper ─────────────────────────────────────────────
-
-struct Sem {
-    ptr: *mut libc::sem_t,
-    name: String,
-    owner: bool, // true = we created and must unlink on drop
-}
-
-unsafe impl Send for Sem {}
-unsafe impl Sync for Sem {}
-
-impl Sem {
-    fn create(name: &str) -> QbResult<Self> {
-        let cname = std::ffi::CString::new(name).map_err(|_| QbError::new(libc::EINVAL))?;
-        let ptr = unsafe {
-            libc::sem_open(
-                cname.as_ptr(),
-                libc::O_CREAT | libc::O_EXCL,
-                0o600u32 as libc::c_uint,
-                0u32,
-            )
-        };
-        if std::ptr::eq(ptr, libc::SEM_FAILED) {
-            return Err(QbError::from_last_os_error());
-        }
-        Ok(Sem {
-            ptr,
-            name: name.to_string(),
-            owner: true,
-        })
-    }
-
-    fn open(name: &str) -> QbResult<Self> {
-        let cname = std::ffi::CString::new(name).map_err(|_| QbError::new(libc::EINVAL))?;
-        let ptr = unsafe { libc::sem_open(cname.as_ptr(), 0) };
-        if std::ptr::eq(ptr, libc::SEM_FAILED) {
-            return Err(QbError::from_last_os_error());
-        }
-        Ok(Sem {
-            ptr,
-            name: name.to_string(),
-            owner: false,
-        })
-    }
-
-    fn post(&self) {
-        unsafe { libc::sem_post(self.ptr) };
-    }
-
-    fn wait_timeout_ms(&self, ms: i32) -> QbResult<()> {
-        if ms < 0 {
-            // Block forever.
-            let r = unsafe { libc::sem_wait(self.ptr) };
-            if r == 0 {
-                return Ok(());
-            }
-            return Err(QbError::from_last_os_error());
-        }
-        if ms == 0 {
-            let r = unsafe { libc::sem_trywait(self.ptr) };
-            if r == 0 {
-                return Ok(());
-            }
-            let e = QbError::from_last_os_error();
-            return Err(if e.errno == libc::EAGAIN {
-                QbError::new(libc::EAGAIN)
-            } else {
-                e
-            });
-        }
-        // Timed wait.
-        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
-        ts.tv_sec += (ms / 1000) as libc::time_t;
-        ts.tv_nsec += (ms % 1000) as libc::c_long * 1_000_000;
-        if ts.tv_nsec >= 1_000_000_000 {
-            ts.tv_sec += 1;
-            ts.tv_nsec -= 1_000_000_000;
-        }
-        let r = unsafe { libc::sem_timedwait(self.ptr, &ts) };
-        if r == 0 {
-            Ok(())
-        } else {
-            Err(QbError::from_last_os_error())
-        }
-    }
-}
-
-impl Drop for Sem {
-    fn drop(&mut self) {
-        unsafe { libc::sem_close(self.ptr) };
-        if self.owner {
-            let cname = std::ffi::CString::new(self.name.as_str()).unwrap();
-            unsafe { libc::sem_unlink(cname.as_ptr()) };
-        }
-    }
-}
-
-// ── Ring buffer ───────────────────────────────────────────────────────────────
-
-/// Shared-memory ring buffer handle.
 pub struct QbRingbuffer {
-    /// Pointer to the header in shared memory.
-    header: *mut RbHeader,
-    /// Base of the double-mapped data area.
-    data: *mut u8,
-    /// Pointer to the user data area (immediately after the header).
-    user_data: *mut libc::c_void,
-    /// File descriptor for the shm file.
-    fd: libc::c_int,
-    /// Total size of the shm file.
-    #[allow(dead_code)]
-    file_size: usize,
-    /// Flags originally passed to open.
-    flags: u32,
-    /// Name (without path prefix).
-    name: String,
-    /// Optional semaphore.
-    sem: Option<Sem>,
+    /// Pointer to the shared header mapping.
+    hdr: *mut RbSharedHdr,
+    /// Pointer to the data array mapping.
+    data: *mut u32,
+    /// Size of the header mapping in bytes.
+    hdr_map_size: usize,
+    /// Size of the data mapping in bytes (= word_size * 4, page-rounded).
+    data_map_size: usize,
+    /// word_size (cached from header).
+    word_size: u32,
+    /// Path to the header file (used for cleanup).
+    hdr_path: String,
+    /// Path to the data file (used for cleanup).
+    data_path: String,
+    /// Whether we created (and own) these files.
+    owner: bool,
 }
 
 unsafe impl Send for QbRingbuffer {}
 unsafe impl Sync for QbRingbuffer {}
 
 impl QbRingbuffer {
-    /// Open (or create) a named ring buffer.
+    /// Open (or create) a ring buffer at `name` (full absolute path prefix,
+    /// without the `-header`/`-data` suffixes).
+    ///
+    /// `size` is the minimum usable data bytes.
+    /// `flags` is a bitmask of QB_RB_FLAG_*.
+    /// `user_data_size` is extra bytes at the end of the header file (e.g. 4 for FC flag).
     pub fn open(name: &str, size: usize, flags: u32, user_data_size: usize) -> QbResult<Box<Self>> {
         if size == 0 || name.is_empty() {
             return Err(QbError::new(libc::EINVAL));
         }
-        // Align data_size to a page boundary.
+
+        let creating = flags & QB_RB_FLAG_CREATE != 0;
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let data_size = (size + page - 1) & !(page - 1);
-        let user_data_size_aligned = (user_data_size + 7) & !7;
-        // mmap() requires the file offset to be page-aligned.  Pad the header
-        // section to the next page boundary so the data region starts at a
-        // page-aligned offset inside the file.
-        let header_raw = HEADER_SIZE + user_data_size_aligned;
-        let data_file_offset = (header_raw + page - 1) & !(page - 1);
-        let file_size = data_file_offset + data_size;
 
-        let shm_path = if name.starts_with('/') {
-            name.to_string()
-        } else {
-            format!("{}/{}", SHM_DIR, name)
-        };
-        let cpath = std::ffi::CString::new(shm_path.clone())
-            .map_err(|_| QbError::new(libc::EINVAL))?;
+        // Compute the word_size: round size up to a page, then convert to words.
+        let real_size = (size + page - 1) & !(page - 1);
+        let word_size = (real_size / 4) as u32;
 
-        let (fd, creating) = if flags & QB_RB_FLAG_CREATE != 0 {
-            let mut fd = unsafe {
-                libc::open(
-                    cpath.as_ptr(),
-                    libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-                    0o600u32 as libc::c_uint,
-                )
-            };
-            if fd < 0 && unsafe { crate::error::get_errno() } == libc::EEXIST {
-                // Stale file from a crashed previous instance — unlink and retry.
-                unsafe { libc::unlink(cpath.as_ptr()) };
-                let sem_name = std::ffi::CString::new(format!("/qbrb-{}", name)).unwrap();
-                unsafe { libc::sem_unlink(sem_name.as_ptr()) };
-                fd = unsafe {
-                    libc::open(
-                        cpath.as_ptr(),
-                        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-                        0o600u32 as libc::c_uint,
-                    )
-                };
+        // Header file: C_SIZEOF_SHARED_HDR + user_data_size bytes.
+        let hdr_map_size = C_SIZEOF_SHARED_HDR + user_data_size;
+        // Data file: real_size bytes (word_size * 4, page-aligned).
+        let data_map_size = real_size;
+
+        let hdr_path = format!("{}-header", name);
+        let data_path_str = format!("{}-data", name);
+
+        let hdr_fd = open_mmap_file(&hdr_path, hdr_map_size, creating)?;
+        let data_fd = match open_mmap_file(&data_path_str, data_map_size, creating) {
+            Ok(fd) => fd,
+            Err(e) => {
+                unsafe { libc::close(hdr_fd) };
+                if creating {
+                    let cp = std::ffi::CString::new(hdr_path.clone()).unwrap();
+                    unsafe { libc::unlink(cp.as_ptr()) };
+                }
+                return Err(e);
             }
-            if fd < 0 {
-                return Err(QbError::from_last_os_error());
-            }
-            (fd, true)
-        } else {
-            let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
-            if fd < 0 {
-                return Err(QbError::from_last_os_error());
-            }
-            (fd, false)
         };
 
-        if creating {
-            // Size the file.
-            if unsafe { libc::ftruncate(fd, file_size as libc::off_t) } < 0 {
-                unsafe { libc::close(fd) };
-                unsafe { libc::unlink(cpath.as_ptr()) };
-                return Err(QbError::from_last_os_error());
-            }
-        }
-
-        // Map header + user data area (offset 0, length = raw header bytes).
-        let header = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                header_raw,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
+        // Map header.
+        let hdr_map = unsafe {
+            libc::mmap(ptr::null_mut(), hdr_map_size,
+                       libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, hdr_fd, 0)
         };
-        if header == libc::MAP_FAILED {
-            unsafe { libc::close(fd) };
+        unsafe { libc::close(hdr_fd) };
+        if hdr_map == libc::MAP_FAILED {
+            unsafe { libc::close(data_fd) };
             if creating {
-                unsafe { libc::unlink(cpath.as_ptr()) };
+                let cp1 = std::ffi::CString::new(hdr_path.clone()).unwrap();
+                let cp2 = std::ffi::CString::new(data_path_str.clone()).unwrap();
+                unsafe { libc::unlink(cp1.as_ptr()); libc::unlink(cp2.as_ptr()) };
             }
             return Err(QbError::from_last_os_error());
         }
 
-        let hdr_ptr = header as *mut RbHeader;
-        let user_data_ptr = unsafe { (header as *mut u8).add(HEADER_SIZE) as *mut libc::c_void };
-
-        // When opening an existing ring buffer, use the data_size that was
-        // written to the header at creation time — the caller's `size` argument
-        // may differ (e.g. client was told max_msg_size, not rb_size).
-        let data_size = if creating {
-            data_size
-        } else {
-            unsafe { (*hdr_ptr).data_size as usize }
+        // Map data.
+        let data_map = unsafe {
+            libc::mmap(ptr::null_mut(), data_map_size,
+                       libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, data_fd, 0)
         };
+        unsafe { libc::close(data_fd) };
+        if data_map == libc::MAP_FAILED {
+            unsafe { libc::munmap(hdr_map, hdr_map_size) };
+            if creating {
+                let cp1 = std::ffi::CString::new(hdr_path.clone()).unwrap();
+                let cp2 = std::ffi::CString::new(data_path_str.clone()).unwrap();
+                unsafe { libc::unlink(cp1.as_ptr()); libc::unlink(cp2.as_ptr()) };
+            }
+            return Err(QbError::from_last_os_error());
+        }
 
-        // Double-map the data area so chunks that wrap around need no special handling.
-        // data_file_offset is page-aligned (required by mmap for file-backed mappings).
-        let double_map = unsafe {
-            // Reserve virtual address space for 2× data_size.
-            let base = libc::mmap(
-                ptr::null_mut(),
-                data_size * 2,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            );
-            if base == libc::MAP_FAILED {
-                libc::munmap(header, header_raw);
-                libc::close(fd);
-                if creating {
-                    libc::unlink(cpath.as_ptr());
-                }
-                return Err(QbError::from_last_os_error());
-            }
-            // First copy.
-            let m1 = libc::mmap(
-                base,
-                data_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_FIXED,
-                fd,
-                data_file_offset as libc::off_t,
-            );
-            // Second copy (mirror).
-            let m2 = libc::mmap(
-                (base as *mut u8).add(data_size) as *mut libc::c_void,
-                data_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_FIXED,
-                fd,
-                data_file_offset as libc::off_t,
-            );
-            if m1 == libc::MAP_FAILED || m2 == libc::MAP_FAILED {
-                libc::munmap(base, data_size * 2);
-                libc::munmap(header, header_raw);
-                libc::close(fd);
-                if creating {
-                    libc::unlink(cpath.as_ptr());
-                }
-                return Err(QbError::from_last_os_error());
-            }
-            base as *mut u8
-        };
+        let hdr_ptr = hdr_map as *mut RbSharedHdr;
+        let data_ptr = data_map as *mut u32;
 
         if creating {
-            // Initialise the header.
+            // Initialise the shared header.
             unsafe {
-                (*hdr_ptr).magic = MAGIC_HEADER;
-                (*hdr_ptr).version = VERSION;
-                (*hdr_ptr).flags = flags;
-                (*hdr_ptr).data_size = data_size as u64;
-                (*hdr_ptr).user_data_size = user_data_size as u32;
+                (*hdr_ptr).write_pt = AtomicU32::new(0);
+                (*hdr_ptr).read_pt = AtomicU32::new(0);
+                (*hdr_ptr).word_size = word_size;
+                // Store hdr_path into the header.
+                copy_path_to_field(&mut (*hdr_ptr).hdr_path, &hdr_path);
+                // Store data_path into the header.
+                copy_path_to_field(&mut (*hdr_ptr).data_path, &data_path_str);
                 (*hdr_ptr).ref_count = AtomicI32::new(1);
-                (*hdr_ptr).write_pt = AtomicU64::new(0);
-                (*hdr_ptr).read_pt = AtomicU64::new(0);
-                let name_bytes = name.as_bytes();
-                let copy_len = name_bytes.len().min(255);
-                let name_dst = (*hdr_ptr).name.as_mut_ptr();
-                std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_dst, copy_len);
-                *name_dst.add(copy_len) = 0;
+                // posix_sem: zero-initialize (equivalent to sem_init(sem, 1, 0) on Linux).
+                (*hdr_ptr).posix_sem = [0u8; 32];
+                // Zero the data area.
+                ptr::write_bytes(data_ptr, 0, word_size as usize);
+                // Sentinel word at word_size (matches C libqb: rb->shared_data[rb->shared_hdr->word_size] = 5).
+                // We can't do this safely since word_size is the exact size, but C does it for debug.
+                // Skip: our data file is exactly word_size words, no space for sentinel.
             }
         } else {
-            // Sanity-check existing header.
             unsafe {
-                if (*hdr_ptr).magic != MAGIC_HEADER || (*hdr_ptr).version != VERSION {
-                    libc::munmap(double_map as *mut libc::c_void, data_size * 2);
-                    libc::munmap(header, header_raw);
-                    libc::close(fd);
-                    return Err(QbError::new(libc::EINVAL));
-                }
                 (*hdr_ptr).ref_count.fetch_add(1, Ordering::SeqCst);
             }
         }
 
-        // Semaphore (unless NO_SEMAPHORE flag is set).
-        let sem = if flags & QB_RB_FLAG_NO_SEMAPHORE == 0 {
-            let sem_name = format!("/qbrb-{}", name);
-            let sem = if creating {
-                // Best-effort unlink in case a previous instance crashed.
-                let cs = std::ffi::CString::new(sem_name.clone()).unwrap();
-                unsafe { libc::sem_unlink(cs.as_ptr()) };
-                Sem::create(&sem_name)?
-            } else {
-                Sem::open(&sem_name)?
-            };
-            Some(sem)
-        } else {
-            None
-        };
+        let ws = unsafe { (*hdr_ptr).word_size };
 
         Ok(Box::new(QbRingbuffer {
-            header: hdr_ptr,
-            data: double_map,
-            user_data: user_data_ptr,
-            fd,
-            file_size,
-            flags,
-            name: name.to_string(),
-            sem,
+            hdr: hdr_ptr,
+            data: data_ptr,
+            hdr_map_size,
+            data_map_size,
+            word_size: ws,
+            hdr_path,
+            data_path: data_path_str,
+            owner: creating,
         }))
     }
 
-    #[inline]
-    fn data_size(&self) -> u64 {
-        unsafe { (*self.header).data_size }
-    }
+    // ── Pointer accessors ─────────────────────────────────────────────────────
 
     #[inline]
-    fn write_pt(&self) -> u64 {
-        unsafe { (*self.header).write_pt.load(Ordering::Acquire) }
+    fn write_pt(&self) -> u32 {
+        unsafe { (*self.hdr).write_pt.load(Ordering::Acquire) }
     }
 
     #[inline]
-    fn read_pt(&self) -> u64 {
-        unsafe { (*self.header).read_pt.load(Ordering::Acquire) }
+    fn read_pt(&self) -> u32 {
+        unsafe { (*self.hdr).read_pt.load(Ordering::Acquire) }
     }
 
-    pub fn space_free(&self) -> isize {
-        let ds = self.data_size() as isize;
-        let used = (self.write_pt() - self.read_pt()) as isize;
-        ds - used
+    #[inline]
+    fn word_at(&self, idx: u32) -> u32 {
+        unsafe { *self.data.add((idx % self.word_size) as usize) }
     }
 
-    pub fn space_used(&self) -> isize {
-        (self.write_pt() - self.read_pt()) as isize
+    #[inline]
+    fn set_word_at(&self, idx: u32, val: u32) {
+        unsafe { *self.data.add((idx % self.word_size) as usize) = val; }
+    }
+
+    // ── Space accounting ──────────────────────────────────────────────────────
+
+    fn space_free_words(&self) -> u32 {
+        let wp = self.write_pt();
+        let rp = self.read_pt();
+        let ws = self.word_size;
+        if wp >= rp {
+            (ws - (wp - rp)).saturating_sub(1)
+        } else {
+            (rp - wp).saturating_sub(1)
+        }
     }
 
     pub fn chunks_used(&self) -> isize {
-        // Walk the buffer and count chunks (O(n) but required by API).
-        let mut count = 0isize;
-        let ds = self.data_size();
-        let mut rp = self.read_pt();
         let wp = self.write_pt();
-        while rp < wp {
-            let pos = (rp % ds) as usize;
-            let hdr = unsafe { &*(self.data.add(pos) as *const ChunkHdr) };
-            if hdr.magic != MAGIC_CHUNK {
-                break;
-            }
-            rp += chunk_total_size(hdr.data_len as usize) as u64;
-            count += 1;
+        let rp = self.read_pt();
+        if wp == rp {
+            return 0;
         }
-        count
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn shared_user_data(&self) -> *mut libc::c_void {
-        self.user_data
+        // Check that the oldest chunk has the committed magic.
+        let magic = self.word_at(rp.wrapping_add(1));
+        if magic == CHUNK_MAGIC { 1 } else { 0 }
     }
 
     pub fn ref_count(&self) -> i32 {
-        unsafe { (*self.header).ref_count.load(Ordering::SeqCst) }
+        unsafe { (*self.hdr).ref_count.load(Ordering::SeqCst) }
     }
 
-    /// Write a chunk.  Returns the number of data bytes written or -errno.
+    pub fn shared_user_data(&self) -> *mut libc::c_void {
+        // user_data starts at offset HDR_STRUCT_SIZE in the header mapping.
+        unsafe { (self.hdr as *mut u8).add(HDR_STRUCT_SIZE) as *mut libc::c_void }
+    }
+
+    // ── Chunk step (matches C's qb_rb_chunk_step) ─────────────────────────────
+    //   step = 2 (header words) + ceil(data_len / 4) (data words)
+
+    fn chunk_step(&self, ptr: u32, data_len: u32) -> u32 {
+        let words = (data_len / 4) + if data_len % 4 != 0 { 1 } else { 0 };
+        (ptr.wrapping_add(2).wrapping_add(words)) % self.word_size
+    }
+
+    // ── Write a chunk ─────────────────────────────────────────────────────────
+
     pub fn chunk_write(&mut self, data: &[u8]) -> QbResult<usize> {
-        let total = chunk_total_size(data.len());
-        self.ensure_space(total)?;
+        let len = data.len() as u32;
+        let words_needed = 2 + (len / 4) + if len % 4 != 0 { 1 } else { 0 };
 
-        let ds = self.data_size();
+        if words_needed >= self.word_size {
+            return Err(QbError::new(libc::ENOSPC));
+        }
+        if self.space_free_words() < words_needed {
+            return Err(QbError::new(libc::EAGAIN));
+        }
+
         let wp = self.write_pt();
-        let pos = (wp % ds) as usize;
-
-        // Write header.
+        // Write size word.
+        self.set_word_at(wp, len);
+        // Write data bytes (word-by-word with modular addressing).
+        copy_bytes_to_ring(self.data, self.word_size, wp.wrapping_add(2), data);
+        // Commit: set magic word (release fence so readers see data first).
+        let magic_idx = (wp.wrapping_add(1)) % self.word_size;
         unsafe {
-            let hdr = self.data.add(pos) as *mut ChunkHdr;
-            (*hdr).data_len = data.len() as u32;
-            (*hdr).magic = MAGIC_CHUNK;
-            // Write data.
-            ptr::copy_nonoverlapping(data.as_ptr(), self.data.add(pos + CHUNK_HDR_SIZE), data.len());
+            let magic_ptr = self.data.add(magic_idx as usize) as *mut AtomicU32;
+            (*magic_ptr).store(CHUNK_MAGIC, Ordering::Release);
         }
-
-        // Advance write pointer with a release fence so readers see the data.
-        unsafe {
-            (*self.header)
-                .write_pt
-                .fetch_add(total as u64, Ordering::Release);
-        }
-
-        if let Some(ref sem) = self.sem {
-            sem.post();
-        }
+        // Advance write pointer.
+        let new_wp = self.chunk_step(wp, len);
+        unsafe { (*self.hdr).write_pt.store(new_wp, Ordering::Release) };
 
         Ok(data.len())
     }
 
-    /// Reserve space for a chunk; returns a mutable slice for the data area.
+    /// Allocate space for a chunk; returns pointer to data area.
     pub fn chunk_alloc(&mut self, len: usize) -> QbResult<*mut u8> {
-        let total = chunk_total_size(len);
-        self.ensure_space(total)?;
+        let len32 = len as u32;
+        let words_needed = 2 + (len32 / 4) + if len32 % 4 != 0 { 1 } else { 0 };
 
-        let ds = self.data_size();
-        let wp = self.write_pt();
-        let pos = (wp % ds) as usize;
-
-        unsafe {
-            let hdr = self.data.add(pos) as *mut ChunkHdr;
-            (*hdr).data_len = len as u32;
-            (*hdr).magic = 0; // not yet committed
-            Ok(self.data.add(pos + CHUNK_HDR_SIZE))
+        if words_needed >= self.word_size {
+            return Err(QbError::new(libc::ENOSPC));
         }
+        if self.space_free_words() < words_needed {
+            return Err(QbError::new(libc::EAGAIN));
+        }
+
+        let wp = self.write_pt();
+        self.set_word_at(wp, len32);
+        // Magic = ALLOC (not yet committed).
+        self.set_word_at(wp.wrapping_add(1), 0xA110CED0u32);
+
+        // Return pointer to data start in the data array.
+        let data_idx = (wp.wrapping_add(2)) % self.word_size;
+        Ok(unsafe { self.data.add(data_idx as usize) as *mut u8 })
     }
 
     /// Commit a previously allocated chunk.
     pub fn chunk_commit(&mut self, len: usize) -> QbResult<()> {
-        let total = chunk_total_size(len);
-        let ds = self.data_size();
+        let len32 = len as u32;
         let wp = self.write_pt();
-        let pos = (wp % ds) as usize;
-
+        // Set length word (in case chunk_alloc didn't get the final size).
+        self.set_word_at(wp, len32);
+        // Set magic (release).
+        let magic_idx = wp.wrapping_add(1) % self.word_size;
         unsafe {
-            let hdr = self.data.add(pos) as *mut ChunkHdr;
-            (*hdr).magic = MAGIC_CHUNK;
-            (*self.header)
-                .write_pt
-                .fetch_add(total as u64, Ordering::Release);
+            let magic_ptr = self.data.add(magic_idx as usize) as *mut AtomicU32;
+            (*magic_ptr).store(CHUNK_MAGIC, Ordering::Release);
         }
-
-        if let Some(ref sem) = self.sem {
-            sem.post();
-        }
+        let new_wp = self.chunk_step(wp, len32);
+        unsafe { (*self.hdr).write_pt.store(new_wp, Ordering::Release) };
         Ok(())
     }
 
-    /// Peek at the oldest chunk.  Returns a pointer to the chunk data (within
-    /// the shared memory region) and the data length.  Call `chunk_reclaim` to
-    /// advance the read pointer.
-    pub fn chunk_peek(&self, ms_timeout: i32) -> QbResult<(*const u8, usize)> {
-        // Wait until data is available.
-        if self.write_pt() == self.read_pt() {
-            if let Some(ref sem) = self.sem {
-                sem.wait_timeout_ms(ms_timeout)?;
-            } else if ms_timeout == 0 {
-                return Err(QbError::new(libc::EAGAIN));
-            } else {
-                // Spin for no-semaphore mode.
-                let deadline = if ms_timeout < 0 {
-                    u64::MAX
-                } else {
-                    crate::util::nano_current() + ms_timeout as u64 * 1_000_000
-                };
-                loop {
-                    if self.write_pt() != self.read_pt() {
-                        break;
-                    }
-                    if crate::util::nano_current() >= deadline {
-                        return Err(QbError::new(libc::ETIMEDOUT));
-                    }
-                    std::hint::spin_loop();
-                }
-            }
-        }
+    // ── Read a chunk ──────────────────────────────────────────────────────────
 
-        let ds = self.data_size();
+    /// Try to read a committed chunk into `buf`.  Returns bytes read or error.
+    /// With `ms_timeout = 0`, returns EAGAIN immediately if no data.
+    pub fn chunk_read(&mut self, buf: &mut [u8], _ms_timeout: i32) -> QbResult<usize> {
+        let wp = self.write_pt();
         let rp = self.read_pt();
-        let pos = (rp % ds) as usize;
-
-        let hdr = unsafe { &*(self.data.add(pos) as *const ChunkHdr) };
-        if hdr.magic != MAGIC_CHUNK {
-            return Err(QbError::new(libc::EILSEQ));
+        if wp == rp {
+            return Err(QbError::new(libc::EAGAIN));
         }
 
-        let data_ptr = unsafe { self.data.add(pos + CHUNK_HDR_SIZE) };
-        Ok((data_ptr, hdr.data_len as usize))
-    }
-
-    /// Advance the read pointer past the oldest chunk.  Call after `chunk_peek`.
-    pub fn chunk_reclaim(&mut self) {
-        let ds = self.data_size();
-        let rp = self.read_pt();
-        let pos = (rp % ds) as usize;
-        let hdr = unsafe { &*(self.data.add(pos) as *const ChunkHdr) };
-        let total = chunk_total_size(hdr.data_len as usize) as u64;
-        unsafe {
-            (*self.header)
-                .read_pt
-                .fetch_add(total, Ordering::Release);
+        // Check magic (acquire fence).
+        let magic_idx = rp.wrapping_add(1) % self.word_size;
+        let magic = unsafe {
+            let mp = self.data.add(magic_idx as usize) as *const AtomicU32;
+            (*mp).load(Ordering::Acquire)
+        };
+        if magic != CHUNK_MAGIC {
+            return Err(QbError::new(libc::EAGAIN));
         }
-    }
 
-    /// Peek, copy to `buf`, and reclaim in one call.
-    pub fn chunk_read(&mut self, buf: &mut [u8], ms_timeout: i32) -> QbResult<usize> {
-        let (ptr, len) = self.chunk_peek(ms_timeout)?;
-        if buf.len() < len {
+        let chunk_len = self.word_at(rp) as usize;
+        if buf.len() < chunk_len {
             return Err(QbError::new(libc::ENOBUFS));
         }
-        unsafe { ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), len) };
-        self.chunk_reclaim();
-        Ok(len)
+
+        // Copy data from ring (with modular addressing).
+        let data_start = rp.wrapping_add(2) % self.word_size;
+        copy_bytes_from_ring(self.data, self.word_size, data_start, &mut buf[..chunk_len]);
+
+        // Mark chunk as dead and advance read pointer.
+        self.set_word_at(rp.wrapping_add(1), CHUNK_MAGIC_DEAD);
+        let new_rp = self.chunk_step(rp, chunk_len as u32);
+        unsafe { (*self.hdr).read_pt.store(new_rp, Ordering::Release) };
+
+        Ok(chunk_len)
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── File ownership ────────────────────────────────────────────────────────
 
-    fn ensure_space(&mut self, needed: usize) -> QbResult<()> {
-        let ds = self.data_size() as usize;
-        if needed > ds {
-            return Err(QbError::new(libc::ENOSPC));
-        }
-
-        loop {
-            let wp = self.write_pt();
-            let rp = self.read_pt();
-            let free = ds as i64 - (wp - rp) as i64;
-
-            if free >= needed as i64 {
-                return Ok(());
-            }
-
-            if self.flags & QB_RB_FLAG_OVERWRITE == 0 {
-                return Err(QbError::new(libc::EAGAIN));
-            }
-
-            // Discard the oldest chunk.
-            let pos = (rp % self.data_size()) as usize;
-            let hdr = unsafe { &*(self.data.add(pos) as *const ChunkHdr) };
-            if hdr.magic != MAGIC_CHUNK {
-                // Corrupt buffer; reset.
-                unsafe {
-                    (*self.header).read_pt.store(wp, Ordering::Release);
-                }
-                return Ok(());
-            }
-            let skip = chunk_total_size(hdr.data_len as usize) as u64;
-            unsafe {
-                (*self.header)
-                    .read_pt
-                    .compare_exchange(rp, rp + skip, Ordering::SeqCst, Ordering::SeqCst)
-                    .ok();
-            }
-        }
-    }
-
-    fn file_path(&self) -> String {
-        if self.name.starts_with('/') { self.name.clone() } else { format!("{}/{}", SHM_DIR, self.name) }
-    }
-
-    pub fn chown(&self, uid: libc::uid_t, gid: libc::gid_t) -> QbResult<()> {
-        let path = self.file_path();
-        let cpath = std::ffi::CString::new(path).unwrap();
-        let r = unsafe { libc::chown(cpath.as_ptr(), uid, gid) };
-        if r == 0 { Ok(()) } else { Err(QbError::from_last_os_error()) }
-    }
-
-    pub fn chmod(&self, mode: libc::mode_t) -> QbResult<()> {
-        let path = self.file_path();
-        let cpath = std::ffi::CString::new(path).unwrap();
-        let r = unsafe { libc::chmod(cpath.as_ptr(), mode) };
-        if r == 0 { Ok(()) } else { Err(QbError::from_last_os_error()) }
-    }
-
-    /// Serialize the ring buffer contents to a file descriptor.
+    /// Write all committed chunks to a file descriptor (for blackbox log dumps).
     pub fn write_to_file(&self, fd: libc::c_int) -> QbResult<usize> {
         let mut rp = self.read_pt();
         let wp = self.write_pt();
-        let ds = self.data_size();
+        let ws = self.word_size;
         let mut total = 0usize;
 
-        while rp < wp {
-            let pos = (rp % ds) as usize;
-            let hdr = unsafe { &*(self.data.add(pos) as *const ChunkHdr) };
-            if hdr.magic != MAGIC_CHUNK {
-                break;
-            }
-            let chunk_size = chunk_total_size(hdr.data_len as usize);
-            let slice = unsafe { std::slice::from_raw_parts(self.data.add(pos), chunk_size) };
-            let written = unsafe { libc::write(fd, slice.as_ptr() as *const _, slice.len()) };
-            if written < 0 {
-                return Err(QbError::from_last_os_error());
-            }
+        while rp != wp {
+            let magic = self.word_at(rp.wrapping_add(1));
+            if magic != CHUNK_MAGIC { break; }
+            let chunk_len = self.word_at(rp) as usize;
+            let data_words = (chunk_len / 4) + if chunk_len % 4 != 0 { 1 } else { 0 };
+            let mut buf = vec![0u8; chunk_len];
+            let data_start = rp.wrapping_add(2) % ws;
+            copy_bytes_from_ring(self.data as *const u32, ws, data_start, &mut buf);
+            let written = unsafe { libc::write(fd, buf.as_ptr() as *const _, buf.len()) };
+            if written < 0 { return Err(QbError::from_last_os_error()); }
             total += written as usize;
-            rp += chunk_size as u64;
+            rp = rp.wrapping_add(2 + data_words as u32) % ws;
         }
         Ok(total)
+    }
+
+    pub fn chown(&self, uid: libc::uid_t, gid: libc::gid_t) -> QbResult<()> {
+        chown_path(&self.hdr_path, uid, gid)?;
+        chown_path(&self.data_path, uid, gid)
+    }
+
+    pub fn chmod(&self, mode: libc::mode_t) -> QbResult<()> {
+        chmod_path(&self.hdr_path, mode)?;
+        chmod_path(&self.data_path, mode)
     }
 }
 
 impl Drop for QbRingbuffer {
     fn drop(&mut self) {
-        let hdr = self.header;
-        let _prev = unsafe { (*hdr).ref_count.fetch_sub(1, Ordering::SeqCst) };
-
-        let header_map_size = unsafe {
-            HEADER_SIZE + (((*hdr).user_data_size as usize + 7) & !7)
-        };
-        let data_size = unsafe { (*hdr).data_size } as usize;
-
-        // Always attempt to unlink.  POSIX guarantees that unlink while other
-        // processes hold open fds merely removes the directory entry; the
-        // memory stays accessible to existing holders until the last fd is
-        // closed.  This also handles the case where the peer exited without
-        // running Drop (e.g. via exit(0)), leaving ref_count > 1 even though
-        // no other process holds the file open.
-        //
-        // If unlink fails (e.g. fault injection returning EACCES), fall back to
-        // truncate so the file is zeroed and can't be mistaken for a live ring
-        // buffer.
-        let path = if self.name.starts_with('/') { self.name.clone() } else { format!("{}/{}", SHM_DIR, self.name) };
-        if let Ok(cp) = std::ffi::CString::new(path) {
-            let r = unsafe { libc::unlink(cp.as_ptr()) };
-            if r != 0 && unsafe { crate::error::get_errno() } != libc::ENOENT {
-                unsafe { libc::truncate(cp.as_ptr(), 0) };
+        unsafe {
+            (*self.hdr).ref_count.fetch_sub(1, Ordering::SeqCst);
+            libc::munmap(self.hdr as *mut libc::c_void, self.hdr_map_size);
+            libc::munmap(self.data as *mut libc::c_void, self.data_map_size);
+        }
+        if self.owner {
+            for path in [&self.hdr_path, &self.data_path] {
+                if let Ok(cp) = std::ffi::CString::new(path.as_str()) {
+                    unsafe { libc::unlink(cp.as_ptr()) };
+                }
             }
         }
-
-        // Drop semaphore before unmapping.
-        self.sem = None;
-
-        unsafe {
-            libc::munmap(self.data as *mut libc::c_void, data_size * 2);
-            libc::munmap(self.header as *mut libc::c_void, header_map_size);
-            libc::close(self.fd);
-        }
     }
 }
 
-// ── C API ─────────────────────────────────────────────────────────────────────
+// ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Open (or create) a named ring buffer.
-///
-/// `flags` is a bitmask of `QB_RB_FLAG_*` constants.
-/// `shared_user_data_size` bytes of user data are reserved after the header.
-///
-/// Returns a pointer to the ring buffer handle, or null on failure (errno set).
-///
-/// # Safety
-/// `name` must be a valid null-terminated C string.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_open(
-    name: *const libc::c_char,
-    size: libc::size_t,
-    flags: u32,
-    shared_user_data_size: libc::size_t,
-) -> *mut QbRingbuffer {
-    if name.is_null() {
-        crate::error::set_errno(libc::EINVAL);
-        return ptr::null_mut();
-    }
-    let name_str = match CStr::from_ptr(name).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            crate::error::set_errno(libc::EINVAL);
-            return ptr::null_mut();
+/// Open or create a regular file at `path` for mmap, sized to `size` bytes.
+fn open_mmap_file(path: &str, size: usize, creating: bool) -> QbResult<libc::c_int> {
+    let cpath = std::ffi::CString::new(path).map_err(|_| {
+        QbError::new(libc::EINVAL)
+    })?;
+    let fd = if creating {
+        let mut fd = unsafe {
+            libc::open(cpath.as_ptr(),
+                       libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_EXCL,
+                       0o600u32 as libc::c_uint)
+        };
+        if fd < 0 && unsafe { crate::error::get_errno() } == libc::EEXIST {
+            // Stale file from a crashed previous instance — unlink and retry.
+            unsafe { libc::unlink(cpath.as_ptr()) };
+            fd = unsafe {
+                libc::open(cpath.as_ptr(),
+                           libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_EXCL,
+                           0o600u32 as libc::c_uint)
+            };
         }
+        fd
+    } else {
+        unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) }
     };
-    match QbRingbuffer::open(name_str, size, flags, shared_user_data_size) {
-        Ok(rb) => Box::into_raw(rb),
-        Err(e) => {
-            crate::error::set_errno(e.errno);
-            ptr::null_mut()
+    if fd < 0 {
+        return Err(QbError::from_last_os_error());
+    }
+    if creating {
+        if unsafe { libc::ftruncate(fd, size as libc::off_t) } < 0 {
+            let e = QbError::from_last_os_error();
+            unsafe { libc::close(fd); libc::unlink(cpath.as_ptr()) };
+            return Err(e);
         }
     }
+    Ok(fd)
 }
 
-/// Close the ring buffer.  The last caller destroys the shared memory.
-///
-/// # Safety
-/// `rb` must be a valid pointer from `qb_rb_open`.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_close(rb: *mut QbRingbuffer) {
-    if !rb.is_null() {
-        drop(Box::from_raw(rb));
-    }
+/// Copy at most 4095 bytes of `src` (NUL-terminated) into a [u8; 4096] field.
+fn copy_path_to_field(dst: &mut [u8; 4096], src: &str) {
+    let b = src.as_bytes();
+    let n = b.len().min(4095);
+    dst[..n].copy_from_slice(&b[..n]);
+    dst[n] = 0;
 }
 
-/// Returns the name of the ring buffer (pointer into shared memory).
-///
-/// # Safety
-/// `rb` must be a valid pointer.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_name_get(rb: *const QbRingbuffer) -> *const libc::c_char {
-    if rb.is_null() {
-        return ptr::null();
-    }
-    (*(*rb).header).name.as_ptr() as *const libc::c_char
-}
-
-/// Returns a pointer to the shared user data area.
-///
-/// # Safety
-/// `rb` must be a valid pointer.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_shared_user_data_get(rb: *const QbRingbuffer) -> *mut libc::c_void {
-    if rb.is_null() {
-        return ptr::null_mut();
-    }
-    (*rb).user_data
-}
-
-/// Returns the current reference count.
-///
-/// # Safety
-/// `rb` must be a valid pointer.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_refcount_get(rb: *const QbRingbuffer) -> i32 {
-    if rb.is_null() {
-        return 0;
-    }
-    (*rb).ref_count()
-}
-
-/// Returns the number of free bytes remaining.
-///
-/// # Safety
-/// `rb` must be a valid pointer.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_space_free(rb: *const QbRingbuffer) -> libc::ssize_t {
-    if rb.is_null() {
-        return -libc::EINVAL as libc::ssize_t;
-    }
-    (*rb).space_free() as libc::ssize_t
-}
-
-/// Returns the number of bytes currently stored (including chunk headers).
-///
-/// # Safety
-/// `rb` must be a valid pointer.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_space_used(rb: *const QbRingbuffer) -> libc::ssize_t {
-    if rb.is_null() {
-        return -libc::EINVAL as libc::ssize_t;
-    }
-    (*rb).space_used() as libc::ssize_t
-}
-
-/// Returns the number of chunks currently stored.
-///
-/// # Safety
-/// `rb` must be a valid pointer.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_chunks_used(rb: *const QbRingbuffer) -> libc::ssize_t {
-    if rb.is_null() {
-        return -libc::EINVAL as libc::ssize_t;
-    }
-    (*rb).chunks_used() as libc::ssize_t
-}
-
-/// Write a chunk to the ring buffer.
-///
-/// Returns the number of data bytes written, or a negative errno value.
-///
-/// # Safety
-/// `rb` and `data` must be valid pointers.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_chunk_write(
-    rb: *mut QbRingbuffer,
-    data: *const libc::c_void,
-    len: libc::size_t,
-) -> libc::ssize_t {
-    if rb.is_null() || data.is_null() {
-        return -libc::EINVAL as libc::ssize_t;
-    }
-    let slice = std::slice::from_raw_parts(data as *const u8, len);
-    match (*rb).chunk_write(slice) {
-        Ok(n) => n as libc::ssize_t,
-        Err(e) => -(e.errno) as libc::ssize_t,
-    }
-}
-
-/// Allocate space for a chunk without writing data.  Fill the returned pointer
-/// then call `qb_rb_chunk_commit`.
-///
-/// # Safety
-/// `rb` must be a valid pointer.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_chunk_alloc(
-    rb: *mut QbRingbuffer,
-    len: libc::size_t,
-) -> *mut libc::c_void {
-    if rb.is_null() {
-        return ptr::null_mut();
-    }
-    match (*rb).chunk_alloc(len) {
-        Ok(p) => p as *mut libc::c_void,
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-/// Commit a chunk allocated with `qb_rb_chunk_alloc`.
-///
-/// # Safety
-/// `rb` must be a valid pointer.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_chunk_commit(rb: *mut QbRingbuffer, len: libc::size_t) -> i32 {
-    if rb.is_null() {
-        return -libc::EINVAL;
-    }
-    match (*rb).chunk_commit(len) {
-        Ok(()) => 0,
-        Err(e) => -(e.errno),
-    }
-}
-
-/// Peek at the oldest chunk without consuming it.  Sets `*data_out` to point
-/// directly into shared memory.  Must call `qb_rb_chunk_reclaim` when done.
-///
-/// `ms_timeout`: 0 = non-blocking, <0 = block forever, >0 = wait N ms.
-///
-/// Returns the data length, or a negative errno value.
-///
-/// # Safety
-/// `rb` and `data_out` must be valid pointers.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_chunk_peek(
-    rb: *const QbRingbuffer,
-    data_out: *mut *mut libc::c_void,
-    ms_timeout: i32,
-) -> libc::ssize_t {
-    if rb.is_null() || data_out.is_null() {
-        return -libc::EINVAL as libc::ssize_t;
-    }
-    match (*rb).chunk_peek(ms_timeout) {
-        Ok((ptr, len)) => {
-            *data_out = ptr as *mut libc::c_void;
-            len as libc::ssize_t
+/// Copy bytes from `src` into the word-addressed ring `data[start_idx..]`, wrapping.
+fn copy_bytes_to_ring(data: *mut u32, word_size: u32, start_idx: u32, src: &[u8]) {
+    let mut byte_off = 0usize;
+    let mut word_idx = start_idx;
+    while byte_off < src.len() {
+        // Build a u32 word from up to 4 bytes.
+        let mut word = 0u32;
+        let chunk = &src[byte_off..(byte_off + 4).min(src.len())];
+        for (i, &b) in chunk.iter().enumerate() {
+            word |= (b as u32) << (i * 8);
         }
-        Err(e) => -(e.errno) as libc::ssize_t,
+        unsafe { *data.add((word_idx % word_size) as usize) = word; }
+        word_idx = word_idx.wrapping_add(1);
+        byte_off += 4;
     }
 }
 
-/// Advance the read pointer past the oldest chunk (call after `qb_rb_chunk_peek`).
-///
-/// # Safety
-/// `rb` must be a valid pointer.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_chunk_reclaim(rb: *mut QbRingbuffer) {
-    if !rb.is_null() {
-        (*rb).chunk_reclaim();
+/// Copy bytes from the word-addressed ring `data[start_idx..]` into `dst`, wrapping.
+fn copy_bytes_from_ring(data: *const u32, word_size: u32, start_idx: u32, dst: &mut [u8]) {
+    let mut byte_off = 0usize;
+    let mut word_idx = start_idx;
+    while byte_off < dst.len() {
+        let word = unsafe { *data.add((word_idx % word_size) as usize) };
+        let remaining = dst.len() - byte_off;
+        let bytes = remaining.min(4);
+        for i in 0..bytes {
+            dst[byte_off + i] = ((word >> (i * 8)) & 0xFF) as u8;
+        }
+        word_idx = word_idx.wrapping_add(1);
+        byte_off += 4;
     }
 }
 
-/// Peek, copy data into `data_out`, then reclaim — all in one call.
-///
-/// # Safety
-/// `rb` and `data_out` must be valid pointers.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_chunk_read(
-    rb: *mut QbRingbuffer,
-    data_out: *mut libc::c_void,
-    len: libc::size_t,
-    ms_timeout: i32,
-) -> libc::ssize_t {
-    if rb.is_null() || data_out.is_null() {
-        return -libc::EINVAL as libc::ssize_t;
-    }
-    let buf = std::slice::from_raw_parts_mut(data_out as *mut u8, len);
-    match (*rb).chunk_read(buf, ms_timeout) {
-        Ok(n) => n as libc::ssize_t,
-        Err(e) => -(e.errno) as libc::ssize_t,
-    }
+fn chown_path(path: &str, uid: libc::uid_t, gid: libc::gid_t) -> QbResult<()> {
+    let cp = std::ffi::CString::new(path).map_err(|_| QbError::new(libc::EINVAL))?;
+    if unsafe { libc::chown(cp.as_ptr(), uid, gid) } == 0 { Ok(()) }
+    else { Err(QbError::from_last_os_error()) }
 }
 
-/// Serialize ring buffer contents to a file descriptor.
-///
-/// # Safety
-/// `rb` must be a valid pointer.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_write_to_file(
-    rb: *const QbRingbuffer,
-    fd: i32,
-) -> libc::ssize_t {
-    if rb.is_null() {
-        return -libc::EINVAL as libc::ssize_t;
-    }
-    match (*rb).write_to_file(fd) {
-        Ok(n) => n as libc::ssize_t,
-        Err(e) => -(e.errno) as libc::ssize_t,
-    }
-}
-
-/// Change the owner of the shared memory file.
-///
-/// # Safety
-/// `rb` must be a valid pointer.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_chown(
-    rb: *const QbRingbuffer,
-    owner: libc::uid_t,
-    group: libc::gid_t,
-) -> i32 {
-    if rb.is_null() {
-        return -libc::EINVAL;
-    }
-    match (*rb).chown(owner, group) {
-        Ok(()) => 0,
-        Err(e) => -(e.errno),
-    }
-}
-
-/// Change the permissions of the shared memory file.
-///
-/// # Safety
-/// `rb` must be a valid pointer.
-#[no_mangle]
-pub unsafe extern "C" fn qb_rb_chmod(rb: *const QbRingbuffer, mode: libc::mode_t) -> i32 {
-    if rb.is_null() {
-        return -libc::EINVAL;
-    }
-    match (*rb).chmod(mode) {
-        Ok(()) => 0,
-        Err(e) => -(e.errno),
-    }
+fn chmod_path(path: &str, mode: libc::mode_t) -> QbResult<()> {
+    let cp = std::ffi::CString::new(path).map_err(|_| QbError::new(libc::EINVAL))?;
+    if unsafe { libc::chmod(cp.as_ptr(), mode) } == 0 { Ok(()) }
+    else { Err(QbError::from_last_os_error()) }
 }

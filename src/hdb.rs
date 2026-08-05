@@ -231,67 +231,93 @@ impl Drop for QbHdbInner {
 }
 
 // ── Public handle type (repr(C), caller-allocatable) ──────────────────────────
+//
+// Must match C libqb's `struct qb_hdb` exactly (x86_64 layout):
+//   uint32_t handle_count;      offset  0
+//   <padding>                   offset  4
+//   qb_array_t *handles;        offset  8   ← we use this slot for our inner ptr
+//   uint32_t iterator;          offset 16
+//   <padding>                   offset 20
+//   void (*destructor)(void *); offset 24
+//   uint32_t first_run;         offset 32   ← QB_TRUE (1) when using QB_HDB_DECLARE
+//   <padding>                   offset 36
+//   sizeof = 40
+//
+// QB_HDB_DECLARE sets first_run=QB_TRUE=1.  C libqb's qb_hdb_handle_create then
+// calls qb_hdb_create on first use.  We replicate that lazy-init here so that
+// databases declared with QB_HDB_DECLARE work without an explicit qb_hdb_create.
+//
+// ALIGNMENT NOTE: C code may pass pointers to `struct qb_hdb` that are only
+// 4-byte aligned (e.g. embedded fields in packed-ish structs like cmap_conn_info).
+// All field reads/writes use byte-offset + read_unaligned/write_unaligned to
+// avoid Rust's alignment checks while still accessing the correct memory.
 
-/// Handle database.  Declare with `QB_HDB_DECLARE` (or zero-initialize) then
-/// call `qb_hdb_create` before use.  The inner pointer is heap-allocated by
-/// `qb_hdb_create` and freed by `qb_hdb_destroy`.
 #[repr(C)]
 pub struct QbHdb {
-    /// Heap-allocated inner state; NULL until `qb_hdb_create` is called.
-    inner: *mut libc::c_void,
-    /// Optional destructor called for each handle instance when freed.
-    pub destructor: Option<unsafe extern "C" fn(*mut libc::c_void)>,
+    _handle_count: u32,
+    _pad0: u32,
+    _inner: *mut libc::c_void,      // offset 8  — accessed only via helpers below
+    _iterator_c: u32,
+    _pad1: u32,
+    _destructor: usize,             // offset 24 — fn ptr stored as usize for repr
+    _first_run: u32,                // offset 32
+    _pad2: u32,
 }
 
 unsafe impl Send for QbHdb {}
 
-impl QbHdb {
-    pub fn new() -> Self {
-        let inner = Box::new(QbHdbInner::new(None));
-        QbHdb {
-            inner: Box::into_raw(inner) as *mut libc::c_void,
-            destructor: None,
-        }
-    }
+// Field byte offsets (verified against C with gcc on x86_64).
+const OFF_INNER: usize = 8;
+const OFF_DESTRUCTOR: usize = 24;
+const OFF_FIRST_RUN: usize = 32;
 
-    pub fn with_destructor(destructor: unsafe extern "C" fn(*mut libc::c_void)) -> Self {
-        let inner = Box::new(QbHdbInner::new(Some(destructor)));
-        QbHdb {
-            inner: Box::into_raw(inner) as *mut libc::c_void,
-            destructor: Some(destructor),
-        }
-    }
+type DestructorFn = unsafe extern "C" fn(*mut libc::c_void);
 
-    fn inner_mut(&mut self) -> Option<&mut QbHdbInner> {
-        if self.inner.is_null() {
-            None
-        } else {
-            Some(unsafe { &mut *(self.inner as *mut QbHdbInner) })
-        }
-    }
-
-    fn inner_ref(&self) -> Option<&QbHdbInner> {
-        if self.inner.is_null() {
-            None
-        } else {
-            Some(unsafe { &*(self.inner as *const QbHdbInner) })
-        }
-    }
+#[inline]
+unsafe fn hdb_read_inner(hdb: *const QbHdb) -> *mut libc::c_void {
+    (hdb as *const u8).add(OFF_INNER).cast::<*mut libc::c_void>().read_unaligned()
+}
+#[inline]
+unsafe fn hdb_write_inner(hdb: *mut QbHdb, val: *mut libc::c_void) {
+    (hdb as *mut u8).add(OFF_INNER).cast::<*mut libc::c_void>().write_unaligned(val);
+}
+#[inline]
+unsafe fn hdb_read_destructor(hdb: *const QbHdb) -> Option<DestructorFn> {
+    (hdb as *const u8).add(OFF_DESTRUCTOR).cast::<Option<DestructorFn>>().read_unaligned()
+}
+#[inline]
+unsafe fn hdb_read_first_run(hdb: *const QbHdb) -> u32 {
+    (hdb as *const u8).add(OFF_FIRST_RUN).cast::<u32>().read_unaligned()
+}
+#[inline]
+unsafe fn hdb_write_first_run(hdb: *mut QbHdb, val: u32) {
+    (hdb as *mut u8).add(OFF_FIRST_RUN).cast::<u32>().write_unaligned(val);
 }
 
-impl Default for QbHdb {
-    fn default() -> Self {
-        Self::new()
+/// Ensure the database is initialised (handles both explicit `qb_hdb_create`
+/// and the lazy path triggered by `QB_HDB_DECLARE`).
+/// Returns a mutable reference to the inner state, or None if `hdb` is null.
+unsafe fn hdb_get_inner(hdb: *mut QbHdb) -> Option<&'static mut QbHdbInner> {
+    if hdb.is_null() {
+        return None;
     }
+    if hdb_read_first_run(hdb) != 0 || hdb_read_inner(hdb).is_null() {
+        // Lazy initialisation: triggered by QB_HDB_DECLARE (first_run=1)
+        // or a zero-initialised struct that was never passed to qb_hdb_create.
+        let destructor = hdb_read_destructor(hdb);
+        let inner = Box::new(QbHdbInner::new(destructor));
+        hdb_write_inner(hdb, Box::into_raw(inner) as *mut libc::c_void);
+        hdb_write_first_run(hdb, 0);
+    }
+    Some(&mut *(hdb_read_inner(hdb) as *mut QbHdbInner))
 }
 
-impl Drop for QbHdb {
-    fn drop(&mut self) {
-        if !self.inner.is_null() {
-            unsafe { drop(Box::from_raw(self.inner as *mut QbHdbInner)) };
-            self.inner = ptr::null_mut();
-        }
+/// Read-only variant — does NOT trigger lazy init (returns None when not ready).
+unsafe fn hdb_get_inner_ref(hdb: *const QbHdb) -> Option<&'static QbHdbInner> {
+    if hdb.is_null() || hdb_read_inner(hdb).is_null() || hdb_read_first_run(hdb) != 0 {
+        return None;
     }
+    Some(&*(hdb_read_inner(hdb) as *const QbHdbInner))
 }
 
 // ── C API ─────────────────────────────────────────────────────────────────────
@@ -300,15 +326,21 @@ impl Drop for QbHdb {
 /// `QB_HDB_DECLARE`-declared `struct qb_hdb`.
 ///
 /// # Safety
-/// `hdb` must be a valid, writable pointer.
+/// `hdb` must be a valid, writable pointer (alignment as low as 4 is accepted).
 #[no_mangle]
 pub unsafe extern "C" fn qb_hdb_create(hdb: *mut QbHdb) {
     if hdb.is_null() {
         return;
     }
-    let destructor = (*hdb).destructor;
+    // Free any previously initialised state.
+    let prev = hdb_read_inner(hdb);
+    if !prev.is_null() {
+        drop(Box::from_raw(prev as *mut QbHdbInner));
+    }
+    let destructor = hdb_read_destructor(hdb);
     let inner = Box::new(QbHdbInner::new(destructor));
-    (*hdb).inner = Box::into_raw(inner) as *mut libc::c_void;
+    hdb_write_inner(hdb, Box::into_raw(inner) as *mut libc::c_void);
+    hdb_write_first_run(hdb, 0);
 }
 
 /// Destroy the database and free all live handles.
@@ -317,11 +349,16 @@ pub unsafe extern "C" fn qb_hdb_create(hdb: *mut QbHdb) {
 /// `hdb` must be a valid pointer previously initialized with `qb_hdb_create`.
 #[no_mangle]
 pub unsafe extern "C" fn qb_hdb_destroy(hdb: *mut QbHdb) {
-    if hdb.is_null() || (*hdb).inner.is_null() {
+    if hdb.is_null() {
         return;
     }
-    drop(Box::from_raw((*hdb).inner as *mut QbHdbInner));
-    (*hdb).inner = ptr::null_mut();
+    let inner = hdb_read_inner(hdb);
+    if inner.is_null() {
+        return;
+    }
+    drop(Box::from_raw(inner as *mut QbHdbInner));
+    hdb_write_inner(hdb, ptr::null_mut());
+    hdb_write_first_run(hdb, 1); // mark as needing re-init if reused
 }
 
 /// Allocate a new handle with `instance_size` bytes of zeroed backing storage.
@@ -337,7 +374,7 @@ pub unsafe extern "C" fn qb_hdb_handle_create(
     if hdb.is_null() || handle_out.is_null() || instance_size < 0 {
         return -libc::EINVAL;
     }
-    let inner = match (*hdb).inner_mut() {
+    let inner = match hdb_get_inner(hdb) {
         Some(i) => i,
         None => return -libc::EINVAL,
     };
@@ -363,7 +400,7 @@ pub unsafe extern "C" fn qb_hdb_handle_get(
     if hdb.is_null() || instance_out.is_null() {
         return -libc::EINVAL;
     }
-    let inner = match (*hdb).inner_mut() {
+    let inner = match hdb_get_inner(hdb) {
         Some(i) => i,
         None => return -libc::EINVAL,
     };
@@ -389,7 +426,7 @@ pub unsafe extern "C" fn qb_hdb_handle_get_always(
     if hdb.is_null() || instance_out.is_null() {
         return -libc::EINVAL;
     }
-    let inner = match (*hdb).inner_mut() {
+    let inner = match hdb_get_inner(hdb) {
         Some(i) => i,
         None => return -libc::EINVAL,
     };
@@ -411,7 +448,7 @@ pub unsafe extern "C" fn qb_hdb_handle_put(hdb: *mut QbHdb, handle: QbHandle) ->
     if hdb.is_null() {
         return -libc::EINVAL;
     }
-    let inner = match (*hdb).inner_mut() {
+    let inner = match hdb_get_inner(hdb) {
         Some(i) => i,
         None => return -libc::EINVAL,
     };
@@ -430,7 +467,7 @@ pub unsafe extern "C" fn qb_hdb_handle_destroy(hdb: *mut QbHdb, handle: QbHandle
     if hdb.is_null() {
         return -libc::EINVAL;
     }
-    let inner = match (*hdb).inner_mut() {
+    let inner = match hdb_get_inner(hdb) {
         Some(i) => i,
         None => return -libc::EINVAL,
     };
@@ -452,7 +489,7 @@ pub unsafe extern "C" fn qb_hdb_handle_refcount_get(
     if hdb.is_null() {
         return -libc::EINVAL;
     }
-    let inner = match (*hdb).inner_ref() {
+    let inner = match hdb_get_inner_ref(hdb) {
         Some(i) => i,
         None => return -libc::EINVAL,
     };
@@ -471,7 +508,7 @@ pub unsafe extern "C" fn qb_hdb_iterator_reset(hdb: *mut QbHdb) {
     if hdb.is_null() {
         return;
     }
-    if let Some(inner) = (*hdb).inner_mut() {
+    if let Some(inner) = hdb_get_inner(hdb) {
         inner.iterator_reset();
     }
 }
@@ -490,7 +527,7 @@ pub unsafe extern "C" fn qb_hdb_iterator_next(
     if hdb.is_null() {
         return -libc::EINVAL;
     }
-    let inner = match (*hdb).inner_mut() {
+    let inner = match hdb_get_inner(hdb) {
         Some(i) => i,
         None => return -libc::EINVAL,
     };
