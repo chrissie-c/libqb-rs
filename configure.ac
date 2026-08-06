@@ -32,6 +32,13 @@ AC_PATH_PROG([CARGO], [cargo])
 AS_IF([test -z "$CARGO"],
   [AC_MSG_ERROR([cargo not found. Install Rust from https://rustup.rs])])
 
+# ── Documentation / man pages ─────────────────────────────────────────────────
+AC_PATH_PROG([DOXYGEN], [doxygen])
+AM_CONDITIONAL([HAVE_DOXYGEN], [test -n "$DOXYGEN"])
+
+AC_PATH_PROG([DOXYGEN2MAN], [doxygen2man])
+AM_CONDITIONAL([BUILD_MAN], [test -n "$DOXYGEN2MAN"])
+
 # ── Output ────────────────────────────────────────────────────────────────────
 AC_CONFIG_FILES([Makefile])
 AC_OUTPUT
@@ -40,12 +47,15 @@ AC_MSG_NOTICE([
 
   libqb-rs $VERSION configured.
 
-    cargo:       $CARGO
-    CC:          $CC
-    CFLAGS:      $CFLAGS
+    cargo:        $CARGO
+    CC:           $CC
+    CFLAGS:       $CFLAGS
     CHECK_CFLAGS: $CHECK_CFLAGS
+    doxygen:      ${DOXYGEN:-not found}
+    doxygen2man:  ${DOXYGEN2MAN:-not found}
 
-  Build:   make
-  Test:    make test
-  Clean:   make clean
+  Build:    make
+  Test:     make test
+  Man pages: make man  (requires doxygen + doxygen2man)
+  Clean:    make clean
 ])

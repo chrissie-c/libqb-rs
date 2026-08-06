@@ -1,0 +1,33 @@
+# Doxyfile for libqb-rs man page generation.
+# Run from the docs/ directory: doxygen man.dox
+# XML output lands in docs/xml/; doxygen2man converts it to docs/man3/.
+
+PROJECT_NAME           = libqb
+PROJECT_NUMBER         = 0.1.0
+
+ALWAYS_DETAILED_SEC    = YES
+FULL_PATH_NAMES        = NO
+JAVADOC_AUTOBRIEF      = YES
+OPTIMIZE_OUTPUT_FOR_C  = YES
+
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = NO
+EXTRACT_LOCAL_METHODS  = YES
+EXTRACT_ANON_NSPACES   = YES
+
+INPUT                  = ../include/qb/
+RECURSIVE              = NO
+FILE_PATTERNS          = *.h
+
+GENERATE_HTML          = NO
+GENERATE_LATEX         = NO
+GENERATE_MAN           = NO
+
+GENERATE_XML           = YES
+XML_OUTPUT             = xml
+OUTPUT_DIRECTORY       = .
+
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = NO

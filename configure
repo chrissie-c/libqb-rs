@@ -642,6 +642,12 @@ ac_subst_vars='am__EXEEXT_FALSE
 am__EXEEXT_TRUE
 LTLIBOBJS
 LIBOBJS
+BUILD_MAN_FALSE
+BUILD_MAN_TRUE
+DOXYGEN2MAN
+HAVE_DOXYGEN_FALSE
+HAVE_DOXYGEN_TRUE
+DOXYGEN
 CARGO
 CHECK_LIBS
 CHECK_CFLAGS
@@ -5259,6 +5265,117 @@ then :
   as_fn_error $? "cargo not found. Install Rust from https://rustup.rs" "$LINENO" 5
 fi
 
+# ── Documentation / man pages ─────────────────────────────────────────────────
+# Extract the first word of "doxygen", so it can be a program name with args.
+set dummy doxygen; ac_word=$2
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for $ac_word" >&5
+printf %s "checking for $ac_word... " >&6; }
+if test ${ac_cv_path_DOXYGEN+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) case $DOXYGEN in
+  [\\/]* | ?:[\\/]*)
+  ac_cv_path_DOXYGEN="$DOXYGEN" # Let the user override the test with a path.
+  ;;
+  *)
+  as_save_IFS=$IFS; IFS=$PATH_SEPARATOR
+for as_dir in $PATH
+do
+  IFS=$as_save_IFS
+  case $as_dir in #(((
+    '') as_dir=./ ;;
+    */) ;;
+    *) as_dir=$as_dir/ ;;
+  esac
+    for ac_exec_ext in '' $ac_executable_extensions; do
+  if as_fn_executable_p "$as_dir$ac_word$ac_exec_ext"; then
+    ac_cv_path_DOXYGEN="$as_dir$ac_word$ac_exec_ext"
+    printf "%s\n" "$as_me:${as_lineno-$LINENO}: found $as_dir$ac_word$ac_exec_ext" >&5
+    break 2
+  fi
+done
+  done
+IFS=$as_save_IFS
+
+  ;;
+esac ;;
+esac
+fi
+DOXYGEN=$ac_cv_path_DOXYGEN
+if test -n "$DOXYGEN"; then
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $DOXYGEN" >&5
+printf "%s\n" "$DOXYGEN" >&6; }
+else
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+fi
+
+
+ if test -n "$DOXYGEN"; then
+  HAVE_DOXYGEN_TRUE=
+  HAVE_DOXYGEN_FALSE='#'
+else
+  HAVE_DOXYGEN_TRUE='#'
+  HAVE_DOXYGEN_FALSE=
+fi
+
+
+# Extract the first word of "doxygen2man", so it can be a program name with args.
+set dummy doxygen2man; ac_word=$2
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for $ac_word" >&5
+printf %s "checking for $ac_word... " >&6; }
+if test ${ac_cv_path_DOXYGEN2MAN+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) case $DOXYGEN2MAN in
+  [\\/]* | ?:[\\/]*)
+  ac_cv_path_DOXYGEN2MAN="$DOXYGEN2MAN" # Let the user override the test with a path.
+  ;;
+  *)
+  as_save_IFS=$IFS; IFS=$PATH_SEPARATOR
+for as_dir in $PATH
+do
+  IFS=$as_save_IFS
+  case $as_dir in #(((
+    '') as_dir=./ ;;
+    */) ;;
+    *) as_dir=$as_dir/ ;;
+  esac
+    for ac_exec_ext in '' $ac_executable_extensions; do
+  if as_fn_executable_p "$as_dir$ac_word$ac_exec_ext"; then
+    ac_cv_path_DOXYGEN2MAN="$as_dir$ac_word$ac_exec_ext"
+    printf "%s\n" "$as_me:${as_lineno-$LINENO}: found $as_dir$ac_word$ac_exec_ext" >&5
+    break 2
+  fi
+done
+  done
+IFS=$as_save_IFS
+
+  ;;
+esac ;;
+esac
+fi
+DOXYGEN2MAN=$ac_cv_path_DOXYGEN2MAN
+if test -n "$DOXYGEN2MAN"; then
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $DOXYGEN2MAN" >&5
+printf "%s\n" "$DOXYGEN2MAN" >&6; }
+else
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+fi
+
+
+ if test -n "$DOXYGEN2MAN"; then
+  BUILD_MAN_TRUE=
+  BUILD_MAN_FALSE='#'
+else
+  BUILD_MAN_TRUE='#'
+  BUILD_MAN_FALSE=
+fi
+
+
 # ── Output ────────────────────────────────────────────────────────────────────
 ac_config_files="$ac_config_files Makefile"
 
@@ -5405,6 +5522,14 @@ Usually this means the macro was only invoked conditionally." "$LINENO" 5
 fi
 if test -z "${am__fastdepCC_TRUE}" && test -z "${am__fastdepCC_FALSE}"; then
   as_fn_error $? "conditional \"am__fastdepCC\" was never defined.
+Usually this means the macro was only invoked conditionally." "$LINENO" 5
+fi
+if test -z "${HAVE_DOXYGEN_TRUE}" && test -z "${HAVE_DOXYGEN_FALSE}"; then
+  as_fn_error $? "conditional \"HAVE_DOXYGEN\" was never defined.
+Usually this means the macro was only invoked conditionally." "$LINENO" 5
+fi
+if test -z "${BUILD_MAN_TRUE}" && test -z "${BUILD_MAN_FALSE}"; then
+  as_fn_error $? "conditional \"BUILD_MAN\" was never defined.
 Usually this means the macro was only invoked conditionally." "$LINENO" 5
 fi
 
@@ -6734,26 +6859,32 @@ fi
 
   libqb-rs $VERSION configured.
 
-    cargo:       $CARGO
-    CC:          $CC
-    CFLAGS:      $CFLAGS
+    cargo:        $CARGO
+    CC:           $CC
+    CFLAGS:       $CFLAGS
     CHECK_CFLAGS: $CHECK_CFLAGS
+    doxygen:      ${DOXYGEN:-not found}
+    doxygen2man:  ${DOXYGEN2MAN:-not found}
 
-  Build:   make
-  Test:    make test
-  Clean:   make clean
+  Build:    make
+  Test:     make test
+  Man pages: make man  (requires doxygen + doxygen2man)
+  Clean:    make clean
 " >&5
 printf "%s\n" "$as_me:
 
   libqb-rs $VERSION configured.
 
-    cargo:       $CARGO
-    CC:          $CC
-    CFLAGS:      $CFLAGS
+    cargo:        $CARGO
+    CC:           $CC
+    CFLAGS:       $CFLAGS
     CHECK_CFLAGS: $CHECK_CFLAGS
+    doxygen:      ${DOXYGEN:-not found}
+    doxygen2man:  ${DOXYGEN2MAN:-not found}
 
-  Build:   make
-  Test:    make test
-  Clean:   make clean
+  Build:    make
+  Test:     make test
+  Man pages: make man  (requires doxygen + doxygen2man)
+  Clean:    make clean
 " >&6;}
 
