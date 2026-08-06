@@ -77,6 +77,8 @@ pub struct QbRingbuffer {
     data_path: String,
     /// Whether we created (and own) these files.
     owner: bool,
+    /// Flags passed to open() — e.g. QB_RB_FLAG_OVERWRITE.
+    pub flags: u32,
 }
 
 unsafe impl Send for QbRingbuffer {}
@@ -193,6 +195,7 @@ impl QbRingbuffer {
             hdr_path,
             data_path: data_path_str,
             owner: creating,
+            flags,
         }))
     }
 
@@ -220,7 +223,7 @@ impl QbRingbuffer {
 
     // ── Space accounting ──────────────────────────────────────────────────────
 
-    fn space_free_words(&self) -> u32 {
+    pub fn space_free_words(&self) -> u32 {
         let wp = self.write_pt();
         let rp = self.read_pt();
         let ws = self.word_size;
@@ -367,6 +370,45 @@ impl QbRingbuffer {
         Ok(chunk_len)
     }
 
+    /// Peek at the next committed chunk without consuming it.
+    /// Returns a raw pointer into the ring buffer data and the chunk length.
+    /// The pointer is valid until the next write or reclaim.
+    /// NOTE: valid only when chunk data does not wrap around the ring boundary.
+    pub fn chunk_peek(&self, _ms_timeout: i32) -> QbResult<(*const u8, usize)> {
+        let wp = self.write_pt();
+        let rp = self.read_pt();
+        if wp == rp {
+            return Err(QbError::new(libc::EAGAIN));
+        }
+
+        let magic_idx = rp.wrapping_add(1) % self.word_size;
+        let magic = unsafe {
+            let mp = self.data.add(magic_idx as usize) as *const AtomicU32;
+            (*mp).load(Ordering::Acquire)
+        };
+        if magic != CHUNK_MAGIC {
+            return Err(QbError::new(libc::EAGAIN));
+        }
+
+        let chunk_len = self.word_at(rp) as usize;
+        let data_start = rp.wrapping_add(2) % self.word_size;
+        let data_ptr = unsafe { self.data.add(data_start as usize) as *const u8 };
+        Ok((data_ptr, chunk_len))
+    }
+
+    /// Reclaim the oldest committed chunk, advancing the read pointer.
+    pub fn chunk_reclaim(&mut self) {
+        let rp = self.read_pt();
+        let wp = self.write_pt();
+        if rp == wp {
+            return;
+        }
+        let chunk_len = self.word_at(rp);
+        self.set_word_at(rp.wrapping_add(1), CHUNK_MAGIC_DEAD);
+        let new_rp = self.chunk_step(rp, chunk_len);
+        unsafe { (*self.hdr).read_pt.store(new_rp, Ordering::Release) };
+    }
+
     // ── File ownership ────────────────────────────────────────────────────────
 
     /// Write all committed chunks to a file descriptor (for blackbox log dumps).
@@ -510,4 +552,162 @@ fn chmod_path(path: &str, mode: libc::mode_t) -> QbResult<()> {
     let cp = std::ffi::CString::new(path).map_err(|_| QbError::new(libc::EINVAL))?;
     if unsafe { libc::chmod(cp.as_ptr(), mode) } == 0 { Ok(()) }
     else { Err(QbError::from_last_os_error()) }
+}
+
+// ── Public C API ──────────────────────────────────────────────────────────────
+//
+// These expose the ring buffer to C callers (e.g. tests compiled against our
+// headers).  The opaque type qb_ringbuffer_t maps to QbRingbuffer via a raw
+// Box pointer: qb_rb_open returns Box::into_raw, qb_rb_close calls
+// Box::from_raw to drop.
+//
+// Space accounting follows C libqb convention:
+//   qb_rb_space_free() returns space_free_words() * 4 bytes.
+//   qb_rb_chunk_write() checks space_free_words() >= 3 + ceil(len/4)
+//   (one extra word vs the internal threshold) so that:
+//     write fails   iff avail < len + 12
+//     write succeeds iff avail >= len + 12
+//   which matches what the check_rb test suite expects.
+
+fn resolve_rb_path(name: &str) -> String {
+    if name.starts_with('/') {
+        return name.to_string();
+    }
+    #[cfg(target_os = "linux")]
+    let dir = "/dev/shm".to_string();
+    #[cfg(not(target_os = "linux"))]
+    let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+    format!("{}/{}", dir, name)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qb_rb_open(
+    name: *const libc::c_char,
+    size: libc::size_t,
+    flags: u32,
+    user_data_size: libc::size_t,
+) -> *mut QbRingbuffer {
+    if name.is_null() {
+        crate::error::set_errno(libc::EINVAL);
+        return std::ptr::null_mut();
+    }
+    let name_str = match std::ffi::CStr::from_ptr(name).to_str() {
+        Ok(s) => s,
+        Err(_) => { crate::error::set_errno(libc::EINVAL); return std::ptr::null_mut(); }
+    };
+    let path = resolve_rb_path(name_str);
+    match QbRingbuffer::open(&path, size, flags, user_data_size) {
+        Ok(rb) => Box::into_raw(rb),
+        Err(e) => { crate::error::set_errno(e.errno); std::ptr::null_mut() }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qb_rb_close(rb: *mut QbRingbuffer) {
+    if !rb.is_null() {
+        drop(Box::from_raw(rb));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qb_rb_chunk_write(
+    rb: *mut QbRingbuffer,
+    data: *const libc::c_void,
+    len: libc::size_t,
+) -> libc::ssize_t {
+    if rb.is_null() || data.is_null() {
+        return -(libc::EINVAL as libc::ssize_t);
+    }
+    let rb_ref = &mut *rb;
+    let len32 = len as u32;
+    // C API threshold: 3 words overhead (size + magic + sentinel guard).
+    let words_needed = 3u32 + (len32 + 3) / 4;
+
+    if words_needed >= rb_ref.word_size {
+        return -(libc::ENOSPC as libc::ssize_t);
+    }
+
+    if rb_ref.flags & QB_RB_FLAG_OVERWRITE != 0 {
+        // Advance read pointer until enough space is available.
+        while rb_ref.space_free_words() < words_needed {
+            let rp = rb_ref.read_pt();
+            let wp = rb_ref.write_pt();
+            if rp == wp {
+                return -(libc::ENOSPC as libc::ssize_t);
+            }
+            // Reclaim the oldest chunk.
+            let old_len = rb_ref.word_at(rp);
+            rb_ref.set_word_at(rp.wrapping_add(1), CHUNK_MAGIC_DEAD);
+            let new_rp = rb_ref.chunk_step(rp, old_len);
+            (*rb_ref.hdr).read_pt.store(new_rp, Ordering::Release);
+        }
+    } else if rb_ref.space_free_words() < words_needed {
+        return -(libc::EAGAIN as libc::ssize_t);
+    }
+
+    let data_slice = std::slice::from_raw_parts(data as *const u8, len);
+    match rb_ref.chunk_write(data_slice) {
+        Ok(_) => len as libc::ssize_t,
+        Err(e) => -(e.errno as libc::ssize_t),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qb_rb_chunk_read(
+    rb: *mut QbRingbuffer,
+    data: *mut libc::c_void,
+    len: libc::size_t,
+    ms_timeout: i32,
+) -> libc::ssize_t {
+    if rb.is_null() || data.is_null() {
+        return -(libc::EINVAL as libc::ssize_t);
+    }
+    let rb_ref = &mut *rb;
+    let buf = std::slice::from_raw_parts_mut(data as *mut u8, len);
+    match rb_ref.chunk_read(buf, ms_timeout) {
+        Ok(n) => n as libc::ssize_t,
+        Err(e) => -(e.errno as libc::ssize_t),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qb_rb_chunk_peek(
+    rb: *mut QbRingbuffer,
+    data_out: *mut *mut libc::c_void,
+    ms_timeout: i32,
+) -> libc::ssize_t {
+    if rb.is_null() || data_out.is_null() {
+        return -(libc::EINVAL as libc::ssize_t);
+    }
+    let rb_ref = &*rb;
+    match rb_ref.chunk_peek(ms_timeout) {
+        Ok((ptr, len)) => {
+            *data_out = ptr as *mut libc::c_void;
+            len as libc::ssize_t
+        }
+        Err(e) => -(e.errno as libc::ssize_t),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qb_rb_chunk_reclaim(rb: *mut QbRingbuffer) {
+    if !rb.is_null() {
+        (*rb).chunk_reclaim();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qb_rb_space_free(rb: *mut QbRingbuffer) -> libc::ssize_t {
+    if rb.is_null() {
+        return -(libc::EINVAL as libc::ssize_t);
+    }
+    ((*rb).space_free_words() as libc::ssize_t) * 4
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qb_rb_chunks_used(rb: *mut QbRingbuffer) -> i32 {
+    if rb.is_null() {
+        return -(libc::EINVAL);
+    }
+    (*rb).chunks_used() as i32
 }

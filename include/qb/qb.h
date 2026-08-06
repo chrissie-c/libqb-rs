@@ -51,7 +51,9 @@ typedef struct timespec timespec;
 /*
  PATH_MAX on Linux (matches C libqb's usage of PATH_MAX in connection response).
  */
+#ifndef PATH_MAX
 #define PATH_MAX 4096
+#endif
 
 #define QB_LOG_MAX_LEN 512
 
@@ -186,6 +188,8 @@ typedef struct qb_map_t qb_map_t;
  Iterator handle returned by `qb_map_iter_create`.
  */
 typedef struct qb_map_iter qb_map_iter;
+
+typedef struct qb_ringbuffer_t qb_ringbuffer_t;
 
 /*
  Multi-split stopwatch.
@@ -718,6 +722,25 @@ const char *qb_ver_str_get(void);
  `buf` must point to at least `buflen` writable bytes.
  */
 char *qb_strerror_r(int32_t errnum, char *buf, size_t buflen);
+
+struct qb_ringbuffer_t *qb_rb_open(const char *name,
+                                   size_t size,
+                                   uint32_t flags,
+                                   size_t user_data_size);
+
+void qb_rb_close(struct qb_ringbuffer_t *rb);
+
+ssize_t qb_rb_chunk_write(struct qb_ringbuffer_t *rb, const void *data, size_t len);
+
+ssize_t qb_rb_chunk_read(struct qb_ringbuffer_t *rb, void *data, size_t len, int32_t ms_timeout);
+
+ssize_t qb_rb_chunk_peek(struct qb_ringbuffer_t *rb, void **data_out, int32_t ms_timeout);
+
+void qb_rb_chunk_reclaim(struct qb_ringbuffer_t *rb);
+
+ssize_t qb_rb_space_free(struct qb_ringbuffer_t *rb);
+
+int32_t qb_rb_chunks_used(struct qb_ringbuffer_t *rb);
 
 struct qb_loop_t *qb_loop_create(void);
 

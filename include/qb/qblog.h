@@ -46,7 +46,7 @@
 #define QB_LOG_FILTER_FORMAT_REGEX     5
 
 /* ── Tag bitmask ───────────────────────────────────────────────── */
-#define QB_LOG_TAG_LIBQB_MSG_BIT  0
+#define QB_LOG_TAG_LIBQB_MSG_BIT  31
 #define QB_LOG_TAG_LIBQB_MSG      (1u << QB_LOG_TAG_LIBQB_MSG_BIT)
 
 /* ── QB_XS / QB_XC extended-info separator ────────────────────── */

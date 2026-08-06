@@ -51,6 +51,13 @@ fn main() {
     // qb_hdb_* function signatures only use the type through a pointer.
     let fixed = guard_hdb_struct(fixed);
 
+    // Guard PATH_MAX so systems that already define it (e.g. FreeBSD) don't
+    // get a redefinition warning.
+    let fixed = fixed.replace(
+        "#define PATH_MAX 4096",
+        "#ifndef PATH_MAX\n#define PATH_MAX 4096\n#endif",
+    );
+
     std::fs::write(&out_path, fixed).unwrap();
 
     // Compile C shims (va_list functions not expressible in stable Rust).

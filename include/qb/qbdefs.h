@@ -38,9 +38,11 @@
 #define qb_bit_is_clear(barray, bit) (!((barray) & qb_bit_value(bit)))
 
 /* IPC type aliases matching C libqb's qb_ipc_type_t values */
-#define QB_IPC_NATIVE 0
-#define QB_IPC_SHM    1
-#define QB_IPC_SOCKET 2
+#define QB_IPC_SOCKET   0
+#define QB_IPC_SHM      1
+#define QB_IPC_POSIX_MQ 2
+#define QB_IPC_SYSV_MQ  3
+#define QB_IPC_NATIVE   4
 
 /* Loop priority aliases (from qb_loop_priority enum: Low=0, Med=1, High=2) */
 #define QB_LOOP_LOW  0
